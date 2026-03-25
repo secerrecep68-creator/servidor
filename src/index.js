@@ -34,9 +34,17 @@ app.get("/health", (req, res) => {
 
 // Iniciar servidor e restaurar sessões
 app.listen(PORT, async () => {
+  const webhookUrl = process.env.WEBHOOK_URL;
+
   console.log(`\n🚀 Baileys Server rodando na porta ${PORT}`);
   console.log(`📡 Health: http://localhost:${PORT}/health`);
-  console.log(`📋 Sessões: http://localhost:${PORT}/sessions\n`);
+  console.log(`📋 Sessões: http://localhost:${PORT}/sessions`);
+  if (webhookUrl) {
+    console.log(`🔗 Webhook: ${webhookUrl}`);
+  } else {
+    console.warn(`⚠️  WEBHOOK_URL não configurada — mensagens recebidas não serão encaminhadas`);
+  }
+  console.log();
 
   // Restaurar sessões salvas
   await sessionManager.restoreSessions();

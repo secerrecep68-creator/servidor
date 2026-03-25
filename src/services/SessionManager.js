@@ -60,6 +60,84 @@ class SessionManager {
     // Salvar credenciais quando atualizar
     socket.ev.on("creds.update", saveCreds);
 
+    // Encaminhar mensagens recebidas ao webhook do Supabase
+    socket.ev.on("messages.upsert", async ({ messages: msgs, type }) => {
+      // Ignorar notificações de histórico/sincronização; processar apenas mensagens novas
+      if (type !== "notify") return;
+
+      const webhookUrl = process.env.WEBHOOK_URL;
+      if (!webhookUrl) return;
+
+      for (const msg of msgs) {
+        // Ignorar mensagens enviadas pelo próprio número
+        if (msg.key?.fromMe) continue;
+
+        try {
+          const from = msg.key?.remoteJid?.replace(/@.+$/, "") || null;
+          const timestamp = msg.messageTimestamp
+            ? new Date(Number(msg.messageTimestamp) * 1000).toISOString()
+            : new Date().toISOString();
+
+          // Determinar tipo e conteúdo da mensagem
+          let messageType = "unknown";
+          let messageContent = null;
+
+          if (msg.message?.conversation) {
+            messageType = "text";
+            messageContent = msg.message.conversation;
+          } else if (msg.message?.extendedTextMessage?.text) {
+            messageType = "text";
+            messageContent = msg.message.extendedTextMessage.text;
+          } else if (msg.message?.imageMessage) {
+            messageType = "image";
+            messageContent = msg.message.imageMessage.caption || null;
+          } else if (msg.message?.videoMessage) {
+            messageType = "video";
+            messageContent = msg.message.videoMessage.caption || null;
+          } else if (msg.message?.audioMessage) {
+            messageType = "audio";
+            messageContent = null;
+          } else if (msg.message?.documentMessage) {
+            messageType = "document";
+            messageContent = msg.message.documentMessage.fileName || null;
+          } else if (msg.message?.stickerMessage) {
+            messageType = "sticker";
+            messageContent = null;
+          } else if (msg.message?.locationMessage) {
+            messageType = "location";
+            messageContent = null;
+          } else if (msg.message?.contactMessage) {
+            messageType = "contact";
+            messageContent = msg.message.contactMessage.displayName || null;
+          }
+
+          const payload = {
+            session_id: sessionId,
+            from,
+            message: messageContent,
+            timestamp,
+            type: messageType,
+          };
+
+          const response = await fetch(webhookUrl, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(payload),
+          });
+
+          if (!response.ok) {
+            console.error(
+              `[${sessionId}] ⚠️ Webhook retornou ${response.status} para mensagem de ${from}`
+            );
+          } else {
+            console.log(`[${sessionId}] 📨 Mensagem de ${from} (${messageType}) enviada ao webhook`);
+          }
+        } catch (err) {
+          console.error(`[${sessionId}] ❌ Erro ao enviar mensagem ao webhook:`, err.message);
+        }
+      }
+    });
+
     // Evento de conexão
     socket.ev.on("connection.update", async (update) => {
       const { connection, lastDisconnect, qr } = update;

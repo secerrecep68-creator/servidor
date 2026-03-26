@@ -112,6 +112,15 @@ setInterval(cleanupCache, 60 * 60 * 1000);
 
 loadCache();
 
+// ── Clear cache on startup if requested ──────────────────
+if (process.env.CLEAR_CACHE_ON_START === "true") {
+  jidToPhoneMap   = {};
+  phoneToJidMap   = {};
+  jidMigrationLog = {};
+  saveCache();
+  console.log("[cache] Cleared on startup (CLEAR_CACHE_ON_START=true)");
+}
+
 function phoneFromMap(rawJid) {
   const entry = jidToPhoneMap[rawJid];
   if (!entry) return null;
@@ -304,27 +313,65 @@ async function reverseResolvePhone(socket, jid) {
   const rawJid = jid.replace(/@.*$/, "");
   const isLid  = jid.endsWith("@lid");
 
+  console.log("[reverseResolve] Attempting to resolve JID: " + jid + " (isLid=" + isLid + ")");
+
+  // 1. Cache hit
   const cached = phoneFromMap(rawJid);
-  if (cached) return cached;
+  if (cached) {
+    console.log("[reverseResolve] Cache hit: " + rawJid + " → " + cached);
+    return cached;
+  }
 
-  if (!isLid && /^55\d{10,11}$/.test(rawJid)) return rawJid;
+  // 2. Non-LID: direct BR number check
+  if (!isLid && /^55\d{10,11}$/.test(rawJid)) {
+    console.log("[reverseResolve] Direct BR number: " + rawJid);
+    return rawJid;
+  }
 
+  // 3. Non-LID: try onWhatsApp lookup
   if (!isLid) {
     const candidates = [rawJid, ...(!rawJid.startsWith("55") && rawJid.length >= 10 ? ["55" + rawJid] : [])];
     for (const candidate of candidates) {
       try {
+        console.log("[reverseResolve] onWhatsApp lookup: " + candidate);
         const result = await socket.onWhatsApp(candidate);
         if (result?.[0]?.exists) {
           const realPhone = result[0].jid.replace(/@.*$/, "");
           cacheJidMapping(jid, realPhone, false);
+          console.log("[reverseResolve] onWhatsApp resolved: " + candidate + " → " + realPhone);
+          return realPhone;
+        }
+      } catch (_) {}
+    }
+    console.log("[reverseResolve] onWhatsApp lookup failed for: " + rawJid);
+    return rawJid;
+  }
+
+  // 4. LID: try onWhatsApp with the numeric part as a phone candidate
+  if (/^\d+$/.test(rawJid)) {
+    const lidCandidates = [rawJid, ...(!rawJid.startsWith("55") && rawJid.length >= 10 ? ["55" + rawJid] : [])];
+    for (const candidate of lidCandidates) {
+      try {
+        console.log("[reverseResolve] LID onWhatsApp lookup: " + candidate);
+        const result = await socket.onWhatsApp(candidate);
+        if (result?.[0]?.exists) {
+          const realPhone = result[0].jid.replace(/@.*$/, "");
+          cacheJidMapping(jid, realPhone, true);
+          console.log("[reverseResolve] LID resolved via onWhatsApp: " + rawJid + " → " + realPhone);
           return realPhone;
         }
       } catch (_) {}
     }
   }
 
-  if (isLid) return null;
-  return rawJid;
+  // 5. LID fallback: return the numeric part as a best-effort phone number
+  if (/^\d+$/.test(rawJid)) {
+    console.warn("[reverseResolve] LID fallback — using numeric part as phone: " + rawJid);
+    return rawJid;
+  }
+
+  console.warn("[reverseResolve] Could not resolve JID: " + jid);
+  return null;
 }
 
 async function resolveWithRetry(socket, jid, attempts = 5) {
@@ -335,7 +382,15 @@ async function resolveWithRetry(socket, jid, attempts = 5) {
     console.log("[retry] LID " + rawJid + " tentativa " + (i + 1) + "/" + attempts);
     await sleep(1000 * (i + 1));
   }
-  return reverseResolvePhone(socket, jid);
+  const resolved = await reverseResolvePhone(socket, jid);
+  if (resolved) return resolved;
+
+  // Last resort: extract numeric part of LID and use as phone number
+  if (jid.endsWith("@lid") && /^\d+$/.test(rawJid)) {
+    console.warn("[retry] Last resort — using LID numeric part as phone: " + rawJid);
+    return rawJid;
+  }
+  return null;
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -524,13 +579,29 @@ async function createSession(sessionId) {
 
   socket.ev.on("contacts.upsert", async (contacts) => {
     for (const contact of contacts) {
-      if (!contact.id || !contact.lid) continue;
-      const phone   = contact.id.replace(/@.*$/, "");
-      const lidFull = contact.lid.endsWith("@lid") ? contact.lid : contact.lid + "@lid";
-      if (!/^\d+$/.test(phone)) continue;
+      // Validate contact.id is present and well-formed
+      if (!contact.id || typeof contact.id !== "string") continue;
+      const phone = contact.id.replace(/@.*$/, "");
+      if (!/^\d{7,15}$/.test(phone)) {
+        console.warn("[contacts.upsert] Skipping malformed contact.id: " + contact.id);
+        continue;
+      }
 
+      // Cache the phone JID mapping
       cacheJidMapping(contact.id, phone, true);
+      console.log("[contacts.upsert] Cached phone JID: " + contact.id + " → " + phone);
+
+      // Cache the LID mapping if present and well-formed
+      if (!contact.lid || typeof contact.lid !== "string") continue;
+      const lidRaw  = contact.lid.replace(/@.*$/, "");
+      if (!/^\d+$/.test(lidRaw)) {
+        console.warn("[contacts.upsert] Skipping malformed contact.lid: " + contact.lid);
+        continue;
+      }
+      const lidFull = contact.lid.endsWith("@lid") ? contact.lid : contact.lid + "@lid";
+
       const { migrated, previousJid } = cacheJidMapping(lidFull, phone, true);
+      console.log("[contacts.upsert] Cached LID: " + lidFull + " → " + phone);
 
       if (migrated) {
         console.log("[contacts.upsert] MIGRAÇÃO: " + phone + " " + previousJid + " → " + lidFull);
@@ -584,6 +655,16 @@ app.get("/stats", (_, res) => res.json({
 }));
 
 app.get("/cache", (_, res) => res.json({ jid_to_phone: jidToPhoneMap, phone_to_jid: phoneToJidMap, migrations: jidMigrationLog }));
+
+app.post("/cache/refresh", (_, res) => {
+  jidToPhoneMap   = {};
+  phoneToJidMap   = {};
+  jidMigrationLog = {};
+  loadCache();
+  const size = Object.keys(jidToPhoneMap).length;
+  console.log("[cache] Manual refresh via /cache/refresh — " + size + " entries loaded");
+  res.json({ success: true, cache_size: size });
+});
 
 app.post("/start", async (req, res) => {
   try {

@@ -505,6 +505,7 @@ async function createSession(sessionId) {
   socket.ev.on("creds.update", saveCreds);
 
   socket.ev.on("messages.upsert", async ({ type, messages }) => {
+    console.log("[DEBUG] upsert type:", type, "msgs:", messages.length);
     if (type !== "notify") return;
     for (const msg of messages) {
       if (msg.key.fromMe || !msg.message) continue;

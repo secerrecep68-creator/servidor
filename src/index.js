@@ -479,9 +479,29 @@ async function dispatchMessage(sessionId, phone, remoteJid, text, msg) {
 }
 
 function extractRealJid(msg) {
-  if (msg.key.remoteJid?.endsWith("@g.us") && msg.key.participant) return msg.key.participant;
+  // 1. Reply: contextInfo.participant tem o número real (mesmo com LID no remoteJid)
+  const replyParticipant =
+    msg.message?.extendedTextMessage?.contextInfo?.participant ||
+    msg.message?.imageMessage?.contextInfo?.participant ||
+    msg.message?.videoMessage?.contextInfo?.participant ||
+    msg.message?.documentMessage?.contextInfo?.participant ||
+    msg.message?.buttonsResponseMessage?.contextInfo?.participant ||
+    msg.message?.listResponseMessage?.contextInfo?.participant ||
+    msg.message?.templateButtonReplyMessage?.contextInfo?.participant;
+
+  if (replyParticipant && replyParticipant.endsWith("@s.whatsapp.net")) {
+    return replyParticipant;
+  }
+
+  // 2. Grupo ou fallback com participant
+  if (msg.key.participant && msg.key.participant.endsWith("@s.whatsapp.net")) {
+    return msg.key.participant;
+  }
+
+  // 3. Padrão
   return msg.key.remoteJid || null;
 }
+
 
 function extractText(msg) {
   const m = msg.message;

@@ -39,6 +39,45 @@ async function sendWebhook(payload) {
   }
 }
 
+// --- Resolve JID (fix Brazilian 9th digit issue) ---
+async function resolveJid(socket, phone) {
+  var cleanPhone = phone.replace(/\D/g, "");
+
+  try {
+    // Try the number as-is first
+    var result = await socket.onWhatsApp(cleanPhone);
+    if (result && result.length > 0 && result[0].exists) {
+      console.log("[jid] Resolved " + cleanPhone + " -> " + result[0].jid);
+      return result[0].jid;
+    }
+
+    // Try alternate format (with/without 9th digit for Brazilian numbers)
+    var altPhone = cleanPhone;
+    if (cleanPhone.length === 13 && cleanPhone.startsWith("55")) {
+      // Remove the 9th digit: 55 + DD + 9XXXXXXXX -> 55 + DD + XXXXXXXX
+      altPhone = cleanPhone.slice(0, 4) + cleanPhone.slice(5);
+    } else if (cleanPhone.length === 12 && cleanPhone.startsWith("55")) {
+      // Add the 9th digit: 55 + DD + XXXXXXXX -> 55 + DD + 9XXXXXXXX
+      altPhone = cleanPhone.slice(0, 4) + "9" + cleanPhone.slice(4);
+    }
+
+    if (altPhone !== cleanPhone) {
+      var result2 = await socket.onWhatsApp(altPhone);
+      if (result2 && result2.length > 0 && result2[0].exists) {
+        console.log("[jid] Resolved alt " + altPhone + " -> " + result2[0].jid);
+        return result2[0].jid;
+      }
+    }
+
+    // Fallback to raw number
+    console.log("[jid] No WhatsApp match, using raw: " + cleanPhone);
+    return cleanPhone + "@s.whatsapp.net";
+  } catch (e) {
+    console.log("[jid] onWhatsApp failed, using raw: " + cleanPhone + " (" + e.message + ")");
+    return cleanPhone + "@s.whatsapp.net";
+  }
+}
+
 // --- Create/Restore Session ---
 async function createSession(sessionId) {
   if (sessions[sessionId] && sessions[sessionId].socket) {
@@ -73,11 +112,10 @@ async function createSession(sessionId) {
   };
   sessions[sessionId] = session;
 
-  // Connection updates - QR, connected, disconnected
+  // Connection updates
   socket.ev.on("connection.update", async (update) => {
     const { connection, lastDisconnect, qr } = update;
 
-    // QR Code
     if (qr) {
       session.qr = qr;
       session.connected = false;
@@ -89,7 +127,6 @@ async function createSession(sessionId) {
       });
     }
 
-    // Connected
     if (connection === "open") {
       session.qr = null;
       session.connected = true;
@@ -103,7 +140,6 @@ async function createSession(sessionId) {
       });
     }
 
-    // Disconnected
     if (connection === "close") {
       session.connected = false;
       var statusCode = lastDisconnect && lastDisconnect.error && lastDisconnect.error.output
@@ -219,9 +255,10 @@ app.post("/send", async function(req, res) {
     var sid = session_id || Object.keys(sessions)[0];
     var session = sessions[sid];
     if (!session || !session.connected) return res.status(400).json({ error: "Session " + sid + " not connected" });
-    var jid = phone.includes("@") ? phone : phone.replace(/\D/g, "") + "@s.whatsapp.net";
+
+    var jid = await resolveJid(session.socket, phone);
     await session.socket.sendMessage(jid, { text: message });
-    res.json({ success: true, session_id: sid, phone: phone });
+    res.json({ success: true, session_id: sid, phone: phone, jid: jid });
   } catch (err) {
     console.error("[send]", err);
     res.status(500).json({ error: err.message });
@@ -239,7 +276,8 @@ app.post("/send-file", async function(req, res) {
     var sid = session_id || Object.keys(sessions)[0];
     var session = sessions[sid];
     if (!session || !session.connected) return res.status(400).json({ error: "Session " + sid + " not connected" });
-    var jid = phone.includes("@") ? phone : phone.replace(/\D/g, "") + "@s.whatsapp.net";
+
+    var jid = await resolveJid(session.socket, phone);
     var ext = file_name.split(".").pop().toLowerCase();
     var imageExts = ["jpg", "jpeg", "png", "gif", "webp"];
     var videoExts = ["mp4", "mov", "avi", "mkv"];
@@ -252,7 +290,7 @@ app.post("/send-file", async function(req, res) {
       msgContent = { document: { url: file_url }, fileName: file_name, mimetype: "application/octet-stream", caption: caption };
     }
     await session.socket.sendMessage(jid, msgContent);
-    res.json({ success: true, session_id: sid, phone: phone, file_name: file_name });
+    res.json({ success: true, session_id: sid, phone: phone, file_name: file_name, jid: jid });
   } catch (err) {
     console.error("[send-file]", err);
     res.status(500).json({ error: err.message });

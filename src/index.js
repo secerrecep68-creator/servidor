@@ -1,13 +1,11 @@
 // ============================================================
-// GORILLA SPAM - Baileys Server (v7 - HARDENED)
-// v6 +
-//   1. resolveWithRetry: backoff apenas no cache (não chama onWhatsApp em loop)
-//   2. TTL seletivo: apenas @s.whatsapp.net não-confirmados expiram (LIDs nunca)
-//   3. Deduplicação de mensagens: Set persistido em disco (sobrevive restart)
-//   4. Fila de mensagens antes do webhook (async, não bloqueia event loop)
-//   5. Rate limit por sessão (queue independente por número)
-//   6. Métricas de operação expostas em GET /stats
-//   7. Cache duplo explícito: @s.whatsapp.net + @lid para mesmo phone
+// GORILLA SPAM - Baileys Server (v8 - LID FIX)
+// v7 +
+//   1. unwrapMessage: desembrulha ephemeral/viewOnce/edited
+//   2. extractRealJid: prioriza contextInfo.participant em todos os tipos
+//   3. extractText: desembrulha antes de extrair texto
+//   4. Cache automático de LID quando resolvido via reply
+//   5. dispatchMessage envia real_phone separado do raw_jid
 // ============================================================
 
 const express = require("express");
@@ -54,12 +52,6 @@ const stats = {
 
 // ═══════════════════════════════════════════════════════════
 //  CACHE JID — com TTL seletivo
-//
-//  jidToPhoneMap[rawJid] = { phone, ts, confirmed }
-//    confirmed=true  → LID ou JID validado via sendMessage/contacts.upsert
-//    confirmed=false → inferido via onWhatsApp (sujeito a TTL de 7 dias)
-//
-//  phoneToJidMap[phone] = jid (string)
 // ═══════════════════════════════════════════════════════════
 const TTL_UNCONFIRMED_MS = 7 * 24 * 60 * 60 * 1000;
 
@@ -74,7 +66,6 @@ function loadCache() {
       jidToPhoneMap   = parsed.jidToPhone   || {};
       phoneToJidMap   = parsed.phoneToJid   || {};
       jidMigrationLog = parsed.migrationLog || {};
-      // Migra entradas antigas (string pura) para o novo formato de objeto
       for (const [k, v] of Object.entries(jidToPhoneMap)) {
         if (typeof v === "string") {
           jidToPhoneMap[k] = { phone: v, ts: Date.now(), confirmed: false };
@@ -103,7 +94,6 @@ function saveCache() {
   });
 }
 
-// TTL cleanup: apenas entradas não-confirmadas expiram; LIDs são permanentes
 function cleanupCache() {
   const now = Date.now();
   let removed = 0;
@@ -128,8 +118,6 @@ function phoneFromMap(rawJid) {
   return typeof entry === "string" ? entry : entry.phone;
 }
 
-// confirmed=true: LID ou JID validado diretamente pelo WhatsApp
-// confirmed=false: onWhatsApp apenas (sujeito a TTL)
 function cacheJidMapping(jid, phone, confirmed = false) {
   const rawJid     = jid.replace(/@.*$/, "");
   const cleanPhone = phone.replace(/\D/g, "");
@@ -152,18 +140,15 @@ function cacheJidMapping(jid, phone, confirmed = false) {
     console.log("[jid-migrate] " + cleanPhone + ": " + previousJid + " → " + jid);
   }
 
-  // LIDs são sempre confirmed=true (o WhatsApp não muda LIDs aleatoriamente)
   const finalConfirm = jid.endsWith("@lid") ? true : confirmed;
 
   jidToPhoneMap[rawJid]     = { phone: cleanPhone, ts: Date.now(), confirmed: finalConfirm };
   phoneToJidMap[cleanPhone] = jid;
 
-  // Mantém alias do rawJid anterior
   if (previousRaw && previousRaw !== rawJid) {
     jidToPhoneMap[previousRaw] = { phone: cleanPhone, ts: Date.now(), confirmed: true };
   }
 
-  // 7. Cache duplo: ao cachear @lid, garante que forma numérica também existe
   if (jid.endsWith("@lid") && /^\d+$/.test(cleanPhone) && !jidToPhoneMap[cleanPhone]) {
     jidToPhoneMap[cleanPhone] = { phone: cleanPhone, ts: Date.now(), confirmed: true };
   }
@@ -173,7 +158,7 @@ function cacheJidMapping(jid, phone, confirmed = false) {
 }
 
 // ═══════════════════════════════════════════════════════════
-//  DEDUPLICAÇÃO — persistida em disco (sobrevive restart)
+//  DEDUPLICAÇÃO
 // ═══════════════════════════════════════════════════════════
 let processedMsgIds = {};
 
@@ -225,16 +210,14 @@ function isDuplicate(msg) {
 }
 
 // ═══════════════════════════════════════════════════════════
-//  FILA DE MENSAGENS — persiste antes do webhook (anti-perda)
-//  appendFile é async — não bloqueia o event loop
+//  FILA DE MENSAGENS
 // ═══════════════════════════════════════════════════════════
 function enqueuePayload(payload) {
   fs.appendFile(QUEUE_FILE, JSON.stringify(payload) + "\n", () => {});
 }
 
 // ═══════════════════════════════════════════════════════════
-//  RATE LIMIT — queue independente por sessão (por número)
-//  Sessão A e B têm filas separadas → cada uma 850ms entre envios
+//  RATE LIMIT
 // ═══════════════════════════════════════════════════════════
 const sendQueues  = {};
 const sendRunning = {};
@@ -251,13 +234,13 @@ async function processSendQueue(sessionId) {
   while (sendQueues[sessionId]?.length > 0) {
     const job = sendQueues[sessionId].shift();
     try { await job(); } catch (e) { console.error("[send-queue]", sessionId, e.message); }
-    await sleep(850);   // ~70 msgs/min por número
+    await sleep(850);
   }
   sendRunning[sessionId] = false;
 }
 
 // ═══════════════════════════════════════════════════════════
-//  WEBHOOK — persiste antes de enviar, retry com backoff
+//  WEBHOOK
 // ═══════════════════════════════════════════════════════════
 async function sendWebhook(payload, retries = 3) {
   if (!WEBHOOK_URL) return;
@@ -316,7 +299,6 @@ function buildBRCandidates(p) {
 
 // ═══════════════════════════════════════════════════════════
 //  REVERSE RESOLVE — JID/LID → phone
-//  onWhatsApp() NÃO resolve @lid. Só o cache resolve.
 // ═══════════════════════════════════════════════════════════
 async function reverseResolvePhone(socket, jid) {
   const rawJid = jid.replace(/@.*$/, "");
@@ -345,18 +327,97 @@ async function reverseResolvePhone(socket, jid) {
   return rawJid;
 }
 
-// 1. RETRY COM BACKOFF CORRETO
-// Só consulta cache em loop — onWhatsApp não resolve LID (inútil chamar repetidamente).
-// contacts.upsert popula o cache assincronamente; esperamos até 15s por ele.
 async function resolveWithRetry(socket, jid, attempts = 5) {
   const rawJid = jid.replace(/@.*$/, "");
   for (let i = 0; i < attempts; i++) {
     const cached = phoneFromMap(rawJid);
     if (cached) { stats.lid_resolved++; return cached; }
     console.log("[retry] LID " + rawJid + " tentativa " + (i + 1) + "/" + attempts);
-    await sleep(1000 * (i + 1));   // 1s, 2s, 3s, 4s, 5s → até 15s total
+    await sleep(1000 * (i + 1));
   }
   return reverseResolvePhone(socket, jid);
+}
+
+// ═══════════════════════════════════════════════════════════
+//  MESSAGE PARSING — v8: unwrap + extractRealJid corrigido
+// ═══════════════════════════════════════════════════════════
+
+// Desembrulha mensagens encapsuladas (ephemeral, viewOnce, edited, etc.)
+function unwrapMessage(msgNode) {
+  if (!msgNode || typeof msgNode !== "object") return msgNode;
+  const inner =
+    msgNode.ephemeralMessage?.message ||
+    msgNode.viewOnceMessage?.message ||
+    msgNode.viewOnceMessageV2?.message ||
+    msgNode.viewOnceMessageV2Extension?.message ||
+    msgNode.documentWithCaptionMessage?.message ||
+    msgNode.editedMessage?.message ||
+    msgNode.protocolMessage?.editedMessage;
+  return inner ? unwrapMessage(inner) : msgNode;
+}
+
+// Busca contextInfo.participant recursivamente em qualquer tipo de mensagem
+function findContextParticipant(msgNode) {
+  if (!msgNode || typeof msgNode !== "object") return null;
+  for (const key of Object.keys(msgNode)) {
+    const val = msgNode[key];
+    if (val && typeof val === "object" && typeof val.contextInfo?.participant === "string") {
+      return val.contextInfo.participant;
+    }
+  }
+  return null;
+}
+
+function extractRealJid(msg) {
+  const m = unwrapMessage(msg.message);
+
+  // 1. PRIORIDADE MÁXIMA: contextInfo.participant (reply com número real)
+  //    Busca em QUALQUER tipo de mensagem que tenha contextInfo
+  const ctxParticipant = findContextParticipant(m);
+  if (ctxParticipant && ctxParticipant.endsWith("@s.whatsapp.net")) {
+    console.log("[extractRealJid] Resolved via contextInfo.participant: " + ctxParticipant);
+    return ctxParticipant;
+  }
+
+  // 2. key.participant (grupos ou quando disponível em chats diretos)
+  if (msg.key.participant && msg.key.participant.endsWith("@s.whatsapp.net")) {
+    console.log("[extractRealJid] Resolved via key.participant: " + msg.key.participant);
+    return msg.key.participant;
+  }
+
+  // 3. Se remoteJid é @s.whatsapp.net com número válido, usa direto
+  const remoteJid = msg.key.remoteJid || "";
+  if (remoteJid.endsWith("@s.whatsapp.net")) {
+    const digits = remoteJid.replace(/@.*$/, "");
+    if (/^\d{10,13}$/.test(digits)) {
+      return remoteJid;
+    }
+  }
+
+  // 4. Fallback: retorna remoteJid (pode ser LID — será resolvido via cache/retry)
+  console.log("[extractRealJid] Fallback to remoteJid: " + remoteJid);
+  return remoteJid || null;
+}
+
+function extractText(msg) {
+  const m = unwrapMessage(msg.message);
+  if (!m) return "";
+  return (
+    m.conversation ||
+    m.extendedTextMessage?.text ||
+    m.imageMessage?.caption ||
+    m.videoMessage?.caption ||
+    m.documentMessage?.caption ||
+    m.audioMessage?.caption ||
+    m.buttonsResponseMessage?.selectedDisplayText ||
+    m.buttonsResponseMessage?.selectedButtonId ||
+    m.listResponseMessage?.title ||
+    m.listResponseMessage?.singleSelectReply?.selectedRowId ||
+    m.templateButtonReplyMessage?.selectedDisplayText ||
+    m.templateButtonReplyMessage?.selectedId ||
+    m.interactiveResponseMessage?.body?.text ||
+    ""
+  );
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -412,32 +473,46 @@ async function createSession(sessionId) {
 
   socket.ev.on("creds.update", saveCreds);
 
+  // ═══════════════════════════════════════════════════════
+  //  messages.upsert — v8: usa extractRealJid corrigido
+  //  + cache automático de LID quando resolvido via reply
+  // ═══════════════════════════════════════════════════════
   socket.ev.on("messages.upsert", async ({ type, messages }) => {
     if (type !== "notify") return;
     for (const msg of messages) {
       if (msg.key.fromMe || !msg.message) continue;
 
-      // 3. DEDUPLICAÇÃO
+      // Deduplicação
       if (isDuplicate(msg)) { console.log("[dedup] Dropped: " + msg.key.id); continue; }
 
       const topicJid = msg.key.remoteJid || "";
       if (!topicJid || topicJid === "status@broadcast" || topicJid.endsWith("@g.us")) continue;
 
       stats.messages_received++;
+
+      // v8: extractRealJid prioriza contextInfo.participant sobre remoteJid
       const remoteJid = extractRealJid(msg) || topicJid;
       let phone = await reverseResolvePhone(socket, remoteJid);
 
       if (!phone) {
         stats.lid_unresolved++;
-        console.warn("[message] LID não resolvido: " + remoteJid + " — retry com backoff");
-        // 1. RETRY COM BACKOFF (substitui setTimeout único de 2s)
+        console.warn("[message] JID não resolvido: " + remoteJid + " — retry com backoff");
         phone = await resolveWithRetry(socket, remoteJid);
         if (!phone) {
-          console.error("[message] LID definitivamente não resolvido: " + remoteJid);
-          // 4. Persiste na fila para replay manual
+          console.error("[message] JID definitivamente não resolvido: " + remoteJid);
           enqueuePayload({ _unresolved: true, jid: remoteJid, session_id: sessionId, text: extractText(msg), ts: Date.now() });
           continue;
         }
+      }
+
+      // v8: Cache automático — se o remoteJid original era um LID mas
+      // conseguimos resolver o phone (via contextInfo), cacheia o LID
+      const originalRemoteJid = msg.key.remoteJid || "";
+      const originalRawJid = originalRemoteJid.replace(/@.*$/, "");
+      const cleanPhone = phone.replace(/\D/g, "");
+      if (originalRawJid && originalRawJid !== cleanPhone && originalRemoteJid.endsWith("@lid")) {
+        cacheJidMapping(originalRemoteJid, cleanPhone, true);
+        console.log("[cache] LID auto-cached via reply resolution: " + originalRawJid + " → " + cleanPhone);
       }
 
       const text = extractText(msg);
@@ -467,45 +542,29 @@ async function createSession(sessionId) {
   return session;
 }
 
+// v8: dispatchMessage envia real_phone explicitamente no payload
 async function dispatchMessage(sessionId, phone, remoteJid, text, msg) {
   const rawJid    = remoteJid.replace(/@.*$/, "");
   const jidType   = remoteJid.endsWith("@lid") ? "lid" : "phone";
-  const migration = jidMigrationLog[phone] || null;
+  const cleanPhone = phone.replace(/\D/g, "");
+  const migration = jidMigrationLog[cleanPhone] || null;
+
+  // Envia tanto phone quanto real_phone para garantir que o webhook resolve
   await sendWebhook({
-    event: "message", session_id: sessionId, phone, message: text, from: phone,
-    raw_jid: rawJid, jid_type: jidType,
+    event:      "message",
+    session_id: sessionId,
+    phone:      cleanPhone,
+    real_phone: cleanPhone,
+    message:    text,
+    from:       cleanPhone,
+    raw_jid:    rawJid,
+    jid_type:   jidType,
+    key: {
+      remoteJid:   msg.key.remoteJid,
+      participant: msg.key.participant || null,
+    },
     migration: migration ? { previous_jid: migration.previous, migrated_at: migration.migratedAt } : null,
   });
-}
-
-function extractRealJid(msg) {
-  // 1. Reply: contextInfo.participant tem o número real (mesmo com LID no remoteJid)
-  const replyParticipant =
-    msg.message?.extendedTextMessage?.contextInfo?.participant ||
-    msg.message?.imageMessage?.contextInfo?.participant ||
-    msg.message?.videoMessage?.contextInfo?.participant ||
-    msg.message?.documentMessage?.contextInfo?.participant ||
-    msg.message?.buttonsResponseMessage?.contextInfo?.participant ||
-    msg.message?.listResponseMessage?.contextInfo?.participant ||
-    msg.message?.templateButtonReplyMessage?.contextInfo?.participant;
-
-  if (replyParticipant && replyParticipant.endsWith("@s.whatsapp.net")) {
-    return replyParticipant;
-  }
-
-  // 2. Grupo ou fallback com participant
-  if (msg.key.participant && msg.key.participant.endsWith("@s.whatsapp.net")) {
-    return msg.key.participant;
-  }
-
-  // 3. Padrão
-  return msg.key.remoteJid || null;
-}
-
-
-function extractText(msg) {
-  const m = msg.message;
-  return m.conversation || m.extendedTextMessage?.text || m.imageMessage?.caption || m.videoMessage?.caption || m.documentMessage?.caption || "";
 }
 
 function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
@@ -514,9 +573,8 @@ function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
 //  ROUTES
 // ═══════════════════════════════════════════════════════════
 
-app.get("/", (_, res) => res.json({ status: "ok", version: "v7", sessions: Object.keys(sessions).length, cache_size: Object.keys(jidToPhoneMap).length }));
+app.get("/", (_, res) => res.json({ status: "ok", version: "v8", sessions: Object.keys(sessions).length, cache_size: Object.keys(jidToPhoneMap).length }));
 
-// 6. MÉTRICAS
 app.get("/stats", (_, res) => res.json({
   ...stats,
   uptime_s:         Math.floor(process.uptime()),
@@ -551,7 +609,6 @@ app.delete("/session/:id", async (req, res) => {
   res.json({ success: true });
 });
 
-// 5. /send com rate limit por sessão
 app.post("/send", async (req, res) => {
   try {
     const { session_id, phone, message } = req.body;
@@ -623,7 +680,7 @@ process.on("SIGINT",  () => shutdown("SIGINT"));
 
 // ── Start ─────────────────────────────────────────────────
 app.listen(PORT, () => {
-  console.log("Gorilla Spam v7 — port " + PORT);
+  console.log("Gorilla Spam v8 — port " + PORT);
   console.log("Webhook:   " + (WEBHOOK_URL || "NOT SET"));
   console.log("Cache:     " + CACHE_FILE);
   console.log("Queue log: " + QUEUE_FILE);

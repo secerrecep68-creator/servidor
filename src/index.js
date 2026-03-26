@@ -1,11 +1,5 @@
 // ============================================================
-// GORILLA SPAM - Baileys Server (v8 - LID FIX)
-// v7 +
-//   1. unwrapMessage: desembrulha ephemeral/viewOnce/edited
-//   2. extractRealJid: prioriza contextInfo.participant em todos os tipos
-//   3. extractText: desembrulha antes de extrair texto
-//   4. Cache automático de LID quando resolvido via reply
-//   5. dispatchMessage envia real_phone separado do raw_jid
+// GORILLA SPAM - Baileys Server (v8 - LID FIX + SUPABASE SYNC)
 // ============================================================
 
 const express = require("express");
@@ -25,6 +19,7 @@ app.use(express.json({ limit: "10mb" }));
 
 const PORT        = process.env.PORT || 3000;
 const WEBHOOK_URL = process.env.WEBHOOK_URL;
+const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY || "";
 const AUTH_DIR    = path.join(__dirname, "..", "auth_sessions");
 const CACHE_DIR   = fs.existsSync("/data") ? "/data" : __dirname;
 const CACHE_FILE  = path.join(CACHE_DIR, "jid_cache.json");
@@ -47,6 +42,8 @@ const stats = {
   webhook_ok:          0,
   webhook_fail:        0,
   queue_flushed:       0,
+  supabase_synced:     0,
+  supabase_resolved:   0,
   started_at:          new Date().toISOString(),
 };
 
@@ -155,6 +152,96 @@ function cacheJidMapping(jid, phone, confirmed = false) {
 
   saveCache();
   return { migrated: wasMigrated, previousJid };
+}
+
+// ═══════════════════════════════════════════════════════════
+//  SUPABASE SYNC — sincroniza cache com banco na conexão
+// ═══════════════════════════════════════════════════════════
+function getSupabaseBaseUrl() {
+  if (!WEBHOOK_URL) return null;
+  return WEBHOOK_URL.replace(/\/functions\/v1\/.*$/, "");
+}
+
+async function syncCacheFromSupabase() {
+  const supabaseUrl = getSupabaseBaseUrl();
+  if (!supabaseUrl || !SUPABASE_ANON_KEY) {
+    console.log("[sync] Supabase não configurado — skip sync");
+    return;
+  }
+
+  try {
+    const res = await fetch(
+      `${supabaseUrl}/rest/v1/jid_mappings?select=jid,phone,jid_type&order=updated_at.desc&limit=500`,
+      {
+        headers: {
+          "apikey": SUPABASE_ANON_KEY,
+          "Authorization": `Bearer ${SUPABASE_ANON_KEY}`,
+        },
+        signal: AbortSignal.timeout(10000),
+      }
+    );
+
+    if (!res.ok) {
+      console.warn("[sync] Falha ao buscar mapeamentos:", res.status);
+      return;
+    }
+
+    const mappings = await res.json();
+    let imported = 0;
+
+    for (const m of mappings) {
+      if (!m.jid || !m.phone) continue;
+      const rawJid = m.jid.replace(/@.*$/, "");
+      const existing = phoneFromMap(rawJid);
+      if (!existing) {
+        const fullJid = m.jid_type === "lid"
+          ? (m.jid.includes("@") ? m.jid : m.jid + "@lid")
+          : (m.jid.includes("@") ? m.jid : m.jid + "@s.whatsapp.net");
+        cacheJidMapping(fullJid, m.phone, true);
+        imported++;
+      }
+    }
+
+    stats.supabase_synced += imported;
+    console.log("[sync] Importados " + imported + " mapeamentos do Supabase (total no DB: " + mappings.length + ")");
+  } catch (e) {
+    console.error("[sync] Erro ao sincronizar cache:", e.message);
+  }
+}
+
+async function resolveFromSupabase(rawJid) {
+  const supabaseUrl = getSupabaseBaseUrl();
+  if (!supabaseUrl || !SUPABASE_ANON_KEY) return null;
+
+  try {
+    const cleanJid = rawJid.replace(/@.*$/, "").replace(/\D/g, "");
+
+    const res = await fetch(
+      `${supabaseUrl}/rest/v1/jid_mappings?select=phone&jid=eq.${cleanJid}&limit=1`,
+      {
+        headers: {
+          "apikey": SUPABASE_ANON_KEY,
+          "Authorization": `Bearer ${SUPABASE_ANON_KEY}`,
+        },
+        signal: AbortSignal.timeout(5000),
+      }
+    );
+
+    if (!res.ok) return null;
+    const data = await res.json();
+
+    if (data?.[0]?.phone) {
+      console.log("[supabase-resolve] " + rawJid + " → " + data[0].phone);
+      const fullJid = rawJid.includes("@") ? rawJid : rawJid + "@lid";
+      cacheJidMapping(fullJid, data[0].phone, true);
+      stats.supabase_resolved++;
+      return data[0].phone;
+    }
+  } catch (e) {
+    console.error("[supabase-resolve] Erro:", e.message);
+  }
+
+  return null;
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -329,20 +416,28 @@ async function reverseResolvePhone(socket, jid) {
 
 async function resolveWithRetry(socket, jid, attempts = 5) {
   const rawJid = jid.replace(/@.*$/, "");
+
+  // Tentativa 1: cache local com backoff
   for (let i = 0; i < attempts; i++) {
     const cached = phoneFromMap(rawJid);
     if (cached) { stats.lid_resolved++; return cached; }
     console.log("[retry] LID " + rawJid + " tentativa " + (i + 1) + "/" + attempts);
     await sleep(1000 * (i + 1));
   }
+
+  // Tentativa 2: consulta direta ao Supabase
+  const supabasePhone = await resolveFromSupabase(rawJid);
+  if (supabasePhone) {
+    stats.lid_resolved++;
+    return supabasePhone;
+  }
+
   return reverseResolvePhone(socket, jid);
 }
 
 // ═══════════════════════════════════════════════════════════
-//  MESSAGE PARSING — v8: unwrap + extractRealJid corrigido
+//  MESSAGE PARSING — unwrap + extractRealJid corrigido
 // ═══════════════════════════════════════════════════════════
-
-// Desembrulha mensagens encapsuladas (ephemeral, viewOnce, edited, etc.)
 function unwrapMessage(msgNode) {
   if (!msgNode || typeof msgNode !== "object") return msgNode;
   const inner =
@@ -356,7 +451,6 @@ function unwrapMessage(msgNode) {
   return inner ? unwrapMessage(inner) : msgNode;
 }
 
-// Busca contextInfo.participant recursivamente em qualquer tipo de mensagem
 function findContextParticipant(msgNode) {
   if (!msgNode || typeof msgNode !== "object") return null;
   for (const key of Object.keys(msgNode)) {
@@ -372,20 +466,19 @@ function extractRealJid(msg) {
   const m = unwrapMessage(msg.message);
 
   // 1. PRIORIDADE MÁXIMA: contextInfo.participant (reply com número real)
-  //    Busca em QUALQUER tipo de mensagem que tenha contextInfo
   const ctxParticipant = findContextParticipant(m);
   if (ctxParticipant && ctxParticipant.endsWith("@s.whatsapp.net")) {
     console.log("[extractRealJid] Resolved via contextInfo.participant: " + ctxParticipant);
     return ctxParticipant;
   }
 
-  // 2. key.participant (grupos ou quando disponível em chats diretos)
+  // 2. key.participant
   if (msg.key.participant && msg.key.participant.endsWith("@s.whatsapp.net")) {
     console.log("[extractRealJid] Resolved via key.participant: " + msg.key.participant);
     return msg.key.participant;
   }
 
-  // 3. Se remoteJid é @s.whatsapp.net com número válido, usa direto
+  // 3. remoteJid se for @s.whatsapp.net válido
   const remoteJid = msg.key.remoteJid || "";
   if (remoteJid.endsWith("@s.whatsapp.net")) {
     const digits = remoteJid.replace(/@.*$/, "");
@@ -394,7 +487,7 @@ function extractRealJid(msg) {
     }
   }
 
-  // 4. Fallback: retorna remoteJid (pode ser LID — será resolvido via cache/retry)
+  // 4. Fallback (pode ser LID — será resolvido via cache/retry/supabase)
   console.log("[extractRealJid] Fallback to remoteJid: " + remoteJid);
   return remoteJid || null;
 }
@@ -455,6 +548,9 @@ async function createSession(sessionId) {
       session.phone = socket.user?.id?.split(":")[0] || null;
       console.log("[connected] " + sessionId + " (" + session.phone + ")");
       await sendWebhook({ event: "connected", session_id: sessionId, connected: true, phone_number: session.phone });
+
+      // Sincroniza cache com Supabase ao conectar
+      await syncCacheFromSupabase();
     }
     if (connection === "close") {
       session.connected = false;
@@ -474,15 +570,13 @@ async function createSession(sessionId) {
   socket.ev.on("creds.update", saveCreds);
 
   // ═══════════════════════════════════════════════════════
-  //  messages.upsert — v8: usa extractRealJid corrigido
-  //  + cache automático de LID quando resolvido via reply
+  //  messages.upsert — extractRealJid + cache auto de LID
   // ═══════════════════════════════════════════════════════
   socket.ev.on("messages.upsert", async ({ type, messages }) => {
     if (type !== "notify") return;
     for (const msg of messages) {
       if (msg.key.fromMe || !msg.message) continue;
 
-      // Deduplicação
       if (isDuplicate(msg)) { console.log("[dedup] Dropped: " + msg.key.id); continue; }
 
       const topicJid = msg.key.remoteJid || "";
@@ -490,13 +584,12 @@ async function createSession(sessionId) {
 
       stats.messages_received++;
 
-      // v8: extractRealJid prioriza contextInfo.participant sobre remoteJid
       const remoteJid = extractRealJid(msg) || topicJid;
       let phone = await reverseResolvePhone(socket, remoteJid);
 
       if (!phone) {
         stats.lid_unresolved++;
-        console.warn("[message] JID não resolvido: " + remoteJid + " — retry com backoff");
+        console.warn("[message] JID não resolvido: " + remoteJid + " — retry com backoff + supabase");
         phone = await resolveWithRetry(socket, remoteJid);
         if (!phone) {
           console.error("[message] JID definitivamente não resolvido: " + remoteJid);
@@ -505,14 +598,13 @@ async function createSession(sessionId) {
         }
       }
 
-      // v8: Cache automático — se o remoteJid original era um LID mas
-      // conseguimos resolver o phone (via contextInfo), cacheia o LID
+      // Cache automático: se remoteJid original era LID mas resolvemos o phone
       const originalRemoteJid = msg.key.remoteJid || "";
       const originalRawJid = originalRemoteJid.replace(/@.*$/, "");
       const cleanPhone = phone.replace(/\D/g, "");
       if (originalRawJid && originalRawJid !== cleanPhone && originalRemoteJid.endsWith("@lid")) {
         cacheJidMapping(originalRemoteJid, cleanPhone, true);
-        console.log("[cache] LID auto-cached via reply resolution: " + originalRawJid + " → " + cleanPhone);
+        console.log("[cache] LID auto-cached: " + originalRawJid + " → " + cleanPhone);
       }
 
       const text = extractText(msg);
@@ -542,14 +634,12 @@ async function createSession(sessionId) {
   return session;
 }
 
-// v8: dispatchMessage envia real_phone explicitamente no payload
 async function dispatchMessage(sessionId, phone, remoteJid, text, msg) {
-  const rawJid    = remoteJid.replace(/@.*$/, "");
-  const jidType   = remoteJid.endsWith("@lid") ? "lid" : "phone";
+  const rawJid     = remoteJid.replace(/@.*$/, "");
+  const jidType    = remoteJid.endsWith("@lid") ? "lid" : "phone";
   const cleanPhone = phone.replace(/\D/g, "");
-  const migration = jidMigrationLog[cleanPhone] || null;
+  const migration  = jidMigrationLog[cleanPhone] || null;
 
-  // Envia tanto phone quanto real_phone para garantir que o webhook resolve
   await sendWebhook({
     event:      "message",
     session_id: sessionId,
@@ -681,9 +771,10 @@ process.on("SIGINT",  () => shutdown("SIGINT"));
 // ── Start ─────────────────────────────────────────────────
 app.listen(PORT, () => {
   console.log("Gorilla Spam v8 — port " + PORT);
-  console.log("Webhook:   " + (WEBHOOK_URL || "NOT SET"));
-  console.log("Cache:     " + CACHE_FILE);
-  console.log("Queue log: " + QUEUE_FILE);
+  console.log("Webhook:      " + (WEBHOOK_URL || "NOT SET"));
+  console.log("Supabase key: " + (SUPABASE_ANON_KEY ? "SET" : "NOT SET"));
+  console.log("Cache:        " + CACHE_FILE);
+  console.log("Queue log:    " + QUEUE_FILE);
   if (fs.existsSync(AUTH_DIR)) {
     const dirs = fs.readdirSync(AUTH_DIR).filter((d) => fs.statSync(path.join(AUTH_DIR, d)).isDirectory());
     console.log("Restoring " + dirs.length + " session(s)...");

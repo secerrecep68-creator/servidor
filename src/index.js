@@ -197,6 +197,29 @@ async function resolveFromSupabase(rawJid) {
   return null;
 }
 
+// ─── NOVO: persiste mapeamento no Supabase ────────────────
+async function upsertSupabaseMapping(jid, phone, jidType = "phone") {
+  if (!SUPABASE_URL || !SUPABASE_KEY) return;
+  try {
+    await fetch(SUPABASE_URL + "/rest/v1/jid_mappings", {
+      method: "POST",
+      headers: {
+        ...supabaseHeaders(),
+        "Content-Type": "application/json",
+        "Prefer": "resolution=merge-duplicates,return=minimal"
+      },
+      body: JSON.stringify({
+        jid:        jid.replace(/@.*$/, ""),
+        phone:      phone.replace(/\D/g, ""),
+        jid_type:   jidType,
+        updated_at: new Date().toISOString()
+      }),
+      signal: AbortSignal.timeout(5000)
+    });
+    console.log("[supabase-upsert] " + jid + " → " + phone);
+  } catch (e) { console.error("[supabase-upsert]", e.message); }
+}
+
 // ═══════════════════════════════════════════════════════════
 //  DEDUPLICAÇÃO — persistida em disco
 // ═══════════════════════════════════════════════════════════
@@ -357,18 +380,34 @@ async function reverseResolvePhone(socket, jid) {
   return rawJid;
 }
 
+// ─── CORRIGIDO: tenta Supabase e socket a cada tentativa ──
 async function resolveWithRetry(socket, jid, attempts = 5) {
   const rawJid = jid.replace(/@.*$/, "");
+
   for (let i = 0; i < attempts; i++) {
+    // 1. Tenta cache local
     const cached = phoneFromMap(rawJid);
     if (cached) { stats.lid_resolved++; return cached; }
+
     console.log("[retry] LID " + rawJid + " tentativa " + (i + 1) + "/" + attempts);
-    await sleep(1000 * (i + 1));   // 1s, 2s, 3s, 4s, 5s → até 15s
+
+    // 2. Tenta Supabase a cada tentativa (não só no final)
+    const supabasePhone = await resolveFromSupabase(rawJid);
+    if (supabasePhone) { stats.lid_resolved++; return supabasePhone; }
+
+    // 3. Tenta reverseResolve com socket
+    const socketPhone = await reverseResolvePhone(socket, jid);
+    if (socketPhone) {
+      cacheJidMapping(jid, socketPhone, true);
+      await upsertSupabaseMapping(jid, socketPhone, "lid");
+      stats.lid_resolved++;
+      return socketPhone;
+    }
+
+    await sleep(1000 * (i + 1));
   }
-  // Fallback: Supabase
-  const supabasePhone = await resolveFromSupabase(rawJid);
-  if (supabasePhone) { stats.lid_resolved++; return supabasePhone; }
-  return reverseResolvePhone(socket, jid);
+
+  return null;
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -536,6 +575,7 @@ async function createSession(sessionId) {
       if (origRemoteJid.endsWith("@lid")) {
         const cleanPhone = phone.replace(/\D/g, "");
         cacheJidMapping(origRemoteJid, cleanPhone, true);
+        await upsertSupabaseMapping(origRemoteJid, cleanPhone, "lid"); // ← persiste no Supabase
       }
 
       const text = extractText(msg);
@@ -553,7 +593,10 @@ async function createSession(sessionId) {
       if (!/^\d+$/.test(phone)) continue;
 
       cacheJidMapping(contact.id, phone, true);
+      await upsertSupabaseMapping(contact.id, phone, "phone"); // ← persiste no Supabase
+
       const { migrated, previousJid } = cacheJidMapping(lidFull, phone, true);
+      await upsertSupabaseMapping(lidFull, phone, "lid"); // ← persiste no Supabase
 
       if (migrated) {
         console.log("[contacts.upsert] MIGRAÇÃO: " + phone + " " + previousJid + " → " + lidFull);
@@ -665,7 +708,9 @@ app.post("/send", async (req, res) => {
     enqueueSend(sid, async () => {
       const result = await session.socket.sendMessage(jid, { text: message });
       if (result?.key?.remoteJid) {
+        const jidType = result.key.remoteJid.endsWith("@lid") ? "lid" : "phone";
         const { migrated, previousJid } = cacheJidMapping(result.key.remoteJid, cleanPhone, true);
+        await upsertSupabaseMapping(result.key.remoteJid, cleanPhone, jidType); // ← persiste no Supabase
         if (migrated) {
           await sendWebhook({ event: "jid_migrated", session_id: sid, phone: cleanPhone, previous_jid: previousJid, current_jid: result.key.remoteJid, migrated_at: new Date().toISOString() });
         }
@@ -698,15 +743,21 @@ app.post("/send-file", async (req, res) => {
     res.json({ success: true, session_id: sid, phone: cleanPhone, file_name, jid, queued: true });
     enqueueSend(sid, async () => {
       const result = await session.socket.sendMessage(jid, msgContent);
-      if (result?.key?.remoteJid) cacheJidMapping(result.key.remoteJid, cleanPhone, true);
+      if (result?.key?.remoteJid) {
+        const jidType = result.key.remoteJid.endsWith("@lid") ? "lid" : "phone";
+        cacheJidMapping(result.key.remoteJid, cleanPhone, true);
+        await upsertSupabaseMapping(result.key.remoteJid, cleanPhone, jidType); // ← persiste no Supabase
+      }
     });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-app.post("/cache-jid", (req, res) => {
+app.post("/cache-jid", async (req, res) => {
   const { jid, phone } = req.body;
   if (!jid || !phone) return res.status(400).json({ error: "jid and phone required" });
   const { migrated, previousJid } = cacheJidMapping(jid, phone, true);
+  const jidType = jid.endsWith("@lid") ? "lid" : "phone";
+  await upsertSupabaseMapping(jid, phone, jidType); // ← persiste no Supabase
   res.json({ success: true, jid, phone, migrated, previousJid });
 });
 

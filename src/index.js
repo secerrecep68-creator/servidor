@@ -1,6 +1,6 @@
 // ============================================================
-// GORILLA SPAM - Baileys Server (CORRIGIDO)
-// Correção: cache JID↔phone para resolver LIDs corretamente
+// GORILLA SPAM - Baileys Server (v3 - LID FIX)
+// Fix: cache from sendMessage result, not just onWhatsApp
 // ============================================================
 
 const express = require("express");
@@ -25,16 +25,15 @@ const AUTH_DIR = path.join(__dirname, "..", "auth_sessions");
 const logger = pino({ level: "warn" });
 const sessions = {};
 
-// ═══ NOVO: Cache global JID ↔ Telefone ═══
-// Quando enviamos mensagem para 5551995434977, o resolveJid descobre o JID real.
-// Armazenamos esse mapeamento para usar quando recebemos mensagens de volta.
-const jidToPhoneMap = {};  // { "87484893552668": "5551995434977", ... }
-const phoneToJidMap = {};  // { "5551995434977": "87484893552668@s.whatsapp.net", ... }
+// ═══ Cache global JID ↔ Telefone ═══
+const jidToPhoneMap = {};
+const phoneToJidMap = {};
 
 function cacheJidMapping(jid, phone) {
   var rawJid = jid.replace(/@.*$/, "");
   var cleanPhone = phone.replace(/\D/g, "");
-  if (rawJid && cleanPhone && rawJid !== cleanPhone) {
+  if (rawJid && cleanPhone) {
+    // Sempre cachear, mesmo se rawJid === cleanPhone (para consistência)
     jidToPhoneMap[rawJid] = cleanPhone;
     phoneToJidMap[cleanPhone] = jid;
     console.log("[jid-cache] Mapped " + rawJid + " <-> " + cleanPhone);
@@ -60,7 +59,7 @@ async function sendWebhook(payload) {
   }
 }
 
-// --- Resolve JID (fix Brazilian 9th digit issue) ---
+// --- Resolve JID ---
 async function resolveJid(socket, phone) {
   var cleanPhone = phone.replace(/\D/g, "");
 
@@ -68,7 +67,6 @@ async function resolveJid(socket, phone) {
     var result = await socket.onWhatsApp(cleanPhone);
     if (result && result.length > 0 && result[0].exists) {
       console.log("[jid] Resolved " + cleanPhone + " -> " + result[0].jid);
-      // ═══ NOVO: Cachear mapeamento ═══
       cacheJidMapping(result[0].jid, cleanPhone);
       return result[0].jid;
     }
@@ -84,7 +82,6 @@ async function resolveJid(socket, phone) {
       var result2 = await socket.onWhatsApp(altPhone);
       if (result2 && result2.length > 0 && result2[0].exists) {
         console.log("[jid] Resolved alt " + altPhone + " -> " + result2[0].jid);
-        // ═══ NOVO: Cachear com o telefone ORIGINAL (com 55) ═══
         cacheJidMapping(result2[0].jid, cleanPhone);
         return result2[0].jid;
       }
@@ -98,37 +95,35 @@ async function resolveJid(socket, phone) {
   }
 }
 
-// ═══ CORRIGIDO: Reverse resolve usando cache primeiro ═══
+// ═══ Reverse resolve: cache → valid BR → onWhatsApp → fallback ═══
 async function reverseResolvePhone(socket, jid) {
   var rawJid = jid.replace(/@.*$/, "");
 
-  // 1. Verificar cache primeiro (resolve LIDs instantaneamente)
+  // 1. Cache hit
   if (jidToPhoneMap[rawJid]) {
     console.log("[reverse-jid] Cache hit: " + rawJid + " -> " + jidToPhoneMap[rawJid]);
     return jidToPhoneMap[rawJid];
   }
 
-  // 2. Se o próprio rawJid já parece um número brasileiro válido, usar direto
+  // 2. Already a valid Brazilian phone
   if (/^55\d{10,11}$/.test(rawJid)) {
     return rawJid;
   }
 
-  // 3. Tentar onWhatsApp para resolver
+  // 3. Try onWhatsApp
   try {
     var result = await socket.onWhatsApp(rawJid);
     if (result && result.length > 0 && result[0].exists) {
       var realPhone = result[0].jid.replace(/@.*$/, "");
-      if (realPhone !== rawJid) {
-        cacheJidMapping(jid, realPhone);
-        console.log("[reverse-jid] onWhatsApp: " + rawJid + " -> " + realPhone);
-      }
+      cacheJidMapping(jid, realPhone);
+      console.log("[reverse-jid] onWhatsApp: " + rawJid + " -> " + realPhone);
       return realPhone;
     }
   } catch (e) {
     console.log("[reverse-jid] lookup failed for " + rawJid + ": " + e.message);
   }
 
-  // 4. Para números sem código de país, tentar adicionar 55
+  // 4. Try adding country code
   if (rawJid.length >= 10 && !rawJid.startsWith("55")) {
     var withCountry = "55" + rawJid;
     try {
@@ -142,8 +137,7 @@ async function reverseResolvePhone(socket, jid) {
     } catch (e) {}
   }
 
-  // 5. Último recurso: retornar o raw (será rejeitado pelo webhook se inválido)
-  console.warn("[reverse-jid] UNRESOLVED LID: " + rawJid + " - no cached mapping found");
+  console.warn("[reverse-jid] UNRESOLVED LID: " + rawJid + " - cache dump:", JSON.stringify(jidToPhoneMap));
   return rawJid;
 }
 
@@ -181,7 +175,6 @@ async function createSession(sessionId) {
   };
   sessions[sessionId] = session;
 
-  // Connection updates
   socket.ev.on("connection.update", async (update) => {
     const { connection, lastDisconnect, qr } = update;
 
@@ -189,11 +182,7 @@ async function createSession(sessionId) {
       session.qr = qr;
       session.connected = false;
       console.log("[qr] " + sessionId + ": New QR generated");
-      await sendWebhook({
-        event: "qr",
-        session_id: sessionId,
-        qr: qr,
-      });
+      await sendWebhook({ event: "qr", session_id: sessionId, qr: qr });
     }
 
     if (connection === "open") {
@@ -235,7 +224,7 @@ async function createSession(sessionId) {
 
   socket.ev.on("creds.update", saveCreds);
 
-  // Incoming messages
+  // ═══ Incoming messages ═══
   socket.ev.on("messages.upsert", async (upsert) => {
     if (upsert.type !== "notify") return;
     var messages = upsert.messages;
@@ -247,7 +236,6 @@ async function createSession(sessionId) {
       var remoteJid = msg.key.remoteJid || "";
       if (!remoteJid || remoteJid === "status@broadcast" || remoteJid.endsWith("@g.us")) continue;
 
-      // ═══ CORRIGIDO: Usa cache + reverseResolve para obter telefone real ═══
       var phone = await reverseResolvePhone(socket, remoteJid);
 
       var text = (msg.message.conversation ||
@@ -279,6 +267,7 @@ app.get("/", function(req, res) {
     status: "ok",
     sessions: Object.keys(sessions).length,
     jid_cache_size: Object.keys(jidToPhoneMap).length,
+    jid_cache: jidToPhoneMap,
   });
 });
 
@@ -326,6 +315,7 @@ app.delete("/session/:id", async function(req, res) {
   res.json({ success: true });
 });
 
+// ═══ CORRIGIDO: /send agora cacheia o JID retornado pelo sendMessage ═══
 app.post("/send", async function(req, res) {
   try {
     var session_id = req.body.session_id;
@@ -337,7 +327,17 @@ app.post("/send", async function(req, res) {
     if (!session || !session.connected) return res.status(400).json({ error: "Session " + sid + " not connected" });
 
     var jid = await resolveJid(session.socket, phone);
-    await session.socket.sendMessage(jid, { text: message });
+    var result = await session.socket.sendMessage(jid, { text: message });
+
+    // ═══ CRÍTICO: O sendMessage retorna o JID real usado (pode ser LID) ═══
+    // Cachear o mapeamento do resultado para futuras mensagens recebidas
+    if (result && result.key && result.key.remoteJid) {
+      var resultJid = result.key.remoteJid;
+      var cleanPhone = phone.replace(/\D/g, "");
+      console.log("[send] sendMessage returned jid: " + resultJid + " for phone: " + cleanPhone);
+      cacheJidMapping(resultJid, cleanPhone);
+    }
+
     res.json({ success: true, session_id: sid, phone: phone, jid: jid });
   } catch (err) {
     console.error("[send]", err);
@@ -345,6 +345,7 @@ app.post("/send", async function(req, res) {
   }
 });
 
+// ═══ CORRIGIDO: /send-file também cacheia resultado ═══
 app.post("/send-file", async function(req, res) {
   try {
     var session_id = req.body.session_id;
@@ -369,7 +370,15 @@ app.post("/send-file", async function(req, res) {
     } else {
       msgContent = { document: { url: file_url }, fileName: file_name, mimetype: "application/octet-stream", caption: caption };
     }
-    await session.socket.sendMessage(jid, msgContent);
+    var result = await session.socket.sendMessage(jid, msgContent);
+
+    // Cachear resultado do sendMessage
+    if (result && result.key && result.key.remoteJid) {
+      var cleanPhone = phone.replace(/\D/g, "");
+      console.log("[send-file] sendMessage returned jid: " + result.key.remoteJid + " for phone: " + cleanPhone);
+      cacheJidMapping(result.key.remoteJid, cleanPhone);
+    }
+
     res.json({ success: true, session_id: sid, phone: phone, file_name: file_name, jid: jid });
   } catch (err) {
     console.error("[send-file]", err);

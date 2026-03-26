@@ -78,6 +78,41 @@ async function resolveJid(socket, phone) {
   }
 }
 
+// --- Reverse resolve: get real phone number from JID ---
+async function reverseResolvePhone(socket, jid) {
+  var rawPhone = jid.replace(/@.*$/, "");
+
+  try {
+    // Use onWhatsApp to check if this JID maps to a known number
+    var result = await socket.onWhatsApp(rawPhone);
+    if (result && result.length > 0 && result[0].exists) {
+      // Extract the real phone from the verified JID
+      var realPhone = result[0].jid.replace(/@.*$/, "");
+      if (realPhone !== rawPhone) {
+        console.log("[reverse-jid] " + rawPhone + " -> " + realPhone);
+      }
+      return realPhone;
+    }
+  } catch (e) {
+    console.log("[reverse-jid] lookup failed for " + rawPhone + ": " + e.message);
+  }
+
+  // For Brazilian numbers, try adding country code or 9th digit
+  if (rawPhone.length >= 10 && !rawPhone.startsWith("55")) {
+    var withCountry = "55" + rawPhone;
+    try {
+      var result2 = await socket.onWhatsApp(withCountry);
+      if (result2 && result2.length > 0 && result2[0].exists) {
+        var realPhone2 = result2[0].jid.replace(/@.*$/, "");
+        console.log("[reverse-jid] Added 55: " + rawPhone + " -> " + realPhone2);
+        return realPhone2;
+      }
+    } catch (e) {}
+  }
+
+  return rawPhone;
+}
+
 // --- Create/Restore Session ---
 async function createSession(sessionId) {
   if (sessions[sessionId] && sessions[sessionId].socket) {
@@ -174,21 +209,28 @@ async function createSession(sessionId) {
       var msg = messages[i];
       if (msg.key.fromMe) continue;
       if (!msg.message) continue;
-      var phone = msg.key.remoteJid ? msg.key.remoteJid.replace(/@.+/, "") : "";
-      if (!phone || phone === "status") continue;
+
+      var remoteJid = msg.key.remoteJid || "";
+      if (!remoteJid || remoteJid === "status@broadcast" || remoteJid.endsWith("@g.us")) continue;
+
+      // FIX: Resolve the real phone number from the JID
+      var phone = await reverseResolvePhone(socket, remoteJid);
+
       var text = (msg.message.conversation ||
         (msg.message.extendedTextMessage && msg.message.extendedTextMessage.text) ||
         (msg.message.imageMessage && msg.message.imageMessage.caption) ||
         (msg.message.videoMessage && msg.message.videoMessage.caption) ||
         (msg.message.documentMessage && msg.message.documentMessage.caption) || "");
       if (!text) continue;
-      console.log("[message] " + sessionId + " from " + phone + ": " + text.substring(0, 50));
+
+      console.log("[message] " + sessionId + " from " + phone + " (jid: " + remoteJid.replace(/@.+/, "") + "): " + text.substring(0, 50));
       await sendWebhook({
         event: "message",
         session_id: sessionId,
         phone: phone,
         message: text,
         from: phone,
+        raw_jid: remoteJid.replace(/@.+/, ""),
       });
     }
   });

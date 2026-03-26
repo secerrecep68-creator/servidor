@@ -1,5 +1,29 @@
 // ============================================================
-// GORILLA SPAM - Baileys Server (v8 - LID FIX + SUPABASE SYNC)
+// GORILLA SPAM - Baileys Server (v9 - MERGE CORRETO)
+// ============================================================
+// v8 trouxe boas adições (Supabase sync, unwrapMessage, extractText expandido)
+// mas quebrou extractRealJid com lógica invertida de contextInfo.participant.
+// Este v9 corrige isso e restaura os itens que foram perdidos no v8.
+//
+// REGRA FUNDAMENTAL (não mudar):
+//   grupo  → msg.key.participant         (quem falou no grupo)
+//   direto → msg.key.remoteJid           (o contato em si)
+//   contextInfo.participant → JAMAIS     (é o autor da msg CITADA, não o remetente)
+//
+// Adições do v8 mantidas:
+//   + Supabase sync no boot (syncCacheFromSupabase)
+//   + resolveFromSupabase como fallback de LID
+//   + unwrapMessage (ephemeral, viewOnce, etc.)
+//   + extractText expandido (botões, listas, interactivo)
+//   + real_phone + key no payload do webhook
+//   + LID auto-cache após resolução
+//
+// Restaurado do v7 (estava faltando no v8):
+//   + Backoff exponencial POR SESSÃO na reconexão
+//   + Validação de número antes de enviar (/send)
+//   + /health com HTTP 503 quando sem sessão
+//   + Delay variável anti-ban (800 + random)
+//   + message_id no payload (idempotência backend)
 // ============================================================
 
 const express = require("express");
@@ -17,14 +41,15 @@ const path = require("path");
 const app = express();
 app.use(express.json({ limit: "10mb" }));
 
-const PORT        = process.env.PORT || 3000;
-const WEBHOOK_URL = process.env.WEBHOOK_URL;
-const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY || "";
-const AUTH_DIR    = path.join(__dirname, "..", "auth_sessions");
-const CACHE_DIR   = fs.existsSync("/data") ? "/data" : __dirname;
-const CACHE_FILE  = path.join(CACHE_DIR, "jid_cache.json");
-const DEDUP_FILE  = path.join(CACHE_DIR, "dedup.json");
-const QUEUE_FILE  = path.join(CACHE_DIR, "queue.log");
+const PORT            = process.env.PORT || 3000;
+const WEBHOOK_URL     = process.env.WEBHOOK_URL;
+const SUPABASE_URL    = process.env.SUPABASE_URL    || "";
+const SUPABASE_KEY    = process.env.SUPABASE_ANON_KEY || "";
+const AUTH_DIR        = path.join(__dirname, "..", "auth_sessions");
+const CACHE_DIR       = fs.existsSync("/data") ? "/data" : __dirname;
+const CACHE_FILE      = path.join(CACHE_DIR, "jid_cache.json");
+const DEDUP_FILE      = path.join(CACHE_DIR, "dedup.json");
+const QUEUE_FILE      = path.join(CACHE_DIR, "queue.log");
 
 const logger   = pino({ level: "warn" });
 const sessions = {};
@@ -64,15 +89,11 @@ function loadCache() {
       phoneToJidMap   = parsed.phoneToJid   || {};
       jidMigrationLog = parsed.migrationLog || {};
       for (const [k, v] of Object.entries(jidToPhoneMap)) {
-        if (typeof v === "string") {
-          jidToPhoneMap[k] = { phone: v, ts: Date.now(), confirmed: false };
-        }
+        if (typeof v === "string") jidToPhoneMap[k] = { phone: v, ts: Date.now(), confirmed: false };
       }
       console.log("[cache] Loaded " + Object.keys(jidToPhoneMap).length + " JID mappings");
     }
-  } catch (e) {
-    console.error("[cache] Load failed:", e.message);
-  }
+  } catch (e) { console.error("[cache] Load failed:", e.message); }
 }
 
 let _savePending = false;
@@ -92,27 +113,21 @@ function saveCache() {
 }
 
 function cleanupCache() {
-  const now = Date.now();
-  let removed = 0;
+  const now = Date.now(); let removed = 0;
   for (const [rawJid, entry] of Object.entries(jidToPhoneMap)) {
     if (!entry.confirmed && (now - (entry.ts || 0)) > TTL_UNCONFIRMED_MS) {
-      delete jidToPhoneMap[rawJid];
-      removed++;
+      delete jidToPhoneMap[rawJid]; removed++;
     }
   }
-  if (removed > 0) {
-    console.log("[cache] TTL cleanup: " + removed + " unconfirmed entries removed");
-    saveCache();
-  }
+  if (removed > 0) { console.log("[cache] TTL: removed " + removed); saveCache(); }
 }
 setInterval(cleanupCache, 60 * 60 * 1000);
 
 loadCache();
 
 function phoneFromMap(rawJid) {
-  const entry = jidToPhoneMap[rawJid];
-  if (!entry) return null;
-  return typeof entry === "string" ? entry : entry.phone;
+  const e = jidToPhoneMap[rawJid];
+  return e ? (typeof e === "string" ? e : e.phone) : null;
 }
 
 function cacheJidMapping(jid, phone, confirmed = false) {
@@ -124,8 +139,7 @@ function cacheJidMapping(jid, phone, confirmed = false) {
   const previousRaw = previousJid ? previousJid.replace(/@.*$/, "") : null;
 
   const wasMigrated =
-    previousJid &&
-    previousRaw !== rawJid &&
+    previousJid && previousRaw !== rawJid &&
     (
       (previousJid.endsWith("@s.whatsapp.net") && jid.endsWith("@lid")) ||
       (previousJid.endsWith("@lid") && jid.endsWith("@s.whatsapp.net"))
@@ -137,115 +151,76 @@ function cacheJidMapping(jid, phone, confirmed = false) {
     console.log("[jid-migrate] " + cleanPhone + ": " + previousJid + " → " + jid);
   }
 
-  const finalConfirm = jid.endsWith("@lid") ? true : confirmed;
+  const finalConfirm            = jid.endsWith("@lid") ? true : confirmed;
+  jidToPhoneMap[rawJid]         = { phone: cleanPhone, ts: Date.now(), confirmed: finalConfirm };
+  phoneToJidMap[cleanPhone]     = jid;
 
-  jidToPhoneMap[rawJid]     = { phone: cleanPhone, ts: Date.now(), confirmed: finalConfirm };
-  phoneToJidMap[cleanPhone] = jid;
+  if (previousRaw && previousRaw !== rawJid)
+    jidToPhoneMap[previousRaw]  = { phone: cleanPhone, ts: Date.now(), confirmed: true };
 
-  if (previousRaw && previousRaw !== rawJid) {
-    jidToPhoneMap[previousRaw] = { phone: cleanPhone, ts: Date.now(), confirmed: true };
-  }
-
-  if (jid.endsWith("@lid") && /^\d+$/.test(cleanPhone) && !jidToPhoneMap[cleanPhone]) {
-    jidToPhoneMap[cleanPhone] = { phone: cleanPhone, ts: Date.now(), confirmed: true };
-  }
+  // Cache duplo: ao cachear @lid, garante que forma numérica pura também existe
+  if (jid.endsWith("@lid") && /^\d+$/.test(cleanPhone) && !jidToPhoneMap[cleanPhone])
+    jidToPhoneMap[cleanPhone]   = { phone: cleanPhone, ts: Date.now(), confirmed: true };
 
   saveCache();
   return { migrated: wasMigrated, previousJid };
 }
 
 // ═══════════════════════════════════════════════════════════
-//  SUPABASE SYNC — sincroniza cache com banco na conexão
+//  SUPABASE SYNC
 // ═══════════════════════════════════════════════════════════
-function getSupabaseBaseUrl() {
-  if (!WEBHOOK_URL) return null;
-  return WEBHOOK_URL.replace(/\/functions\/v1\/.*$/, "");
+function supabaseHeaders() {
+  return { "apikey": SUPABASE_KEY, "Authorization": "Bearer " + SUPABASE_KEY };
 }
 
 async function syncCacheFromSupabase() {
-  const supabaseUrl = getSupabaseBaseUrl();
-  if (!supabaseUrl || !SUPABASE_ANON_KEY) {
-    console.log("[sync] Supabase não configurado — skip sync");
-    return;
-  }
-
+  if (!SUPABASE_URL || !SUPABASE_KEY) { console.log("[sync] Supabase não configurado — skip"); return; }
   try {
     const res = await fetch(
-      `${supabaseUrl}/rest/v1/jid_mappings?select=jid,phone,jid_type&order=updated_at.desc&limit=500`,
-      {
-        headers: {
-          "apikey": SUPABASE_ANON_KEY,
-          "Authorization": `Bearer ${SUPABASE_ANON_KEY}`,
-        },
-        signal: AbortSignal.timeout(10000),
-      }
+      SUPABASE_URL + "/rest/v1/jid_mappings?select=jid,phone,jid_type&order=updated_at.desc&limit=500",
+      { headers: supabaseHeaders(), signal: AbortSignal.timeout(10000) }
     );
-
-    if (!res.ok) {
-      console.warn("[sync] Falha ao buscar mapeamentos:", res.status);
-      return;
-    }
-
+    if (!res.ok) { console.warn("[sync] Falha: " + res.status); return; }
     const mappings = await res.json();
     let imported = 0;
-
     for (const m of mappings) {
       if (!m.jid || !m.phone) continue;
       const rawJid = m.jid.replace(/@.*$/, "");
-      const existing = phoneFromMap(rawJid);
-      if (!existing) {
-        const fullJid = m.jid_type === "lid"
-          ? (m.jid.includes("@") ? m.jid : m.jid + "@lid")
-          : (m.jid.includes("@") ? m.jid : m.jid + "@s.whatsapp.net");
+      if (!phoneFromMap(rawJid)) {
+        const fullJid = m.jid.includes("@") ? m.jid
+          : (m.jid_type === "lid" ? m.jid + "@lid" : m.jid + "@s.whatsapp.net");
         cacheJidMapping(fullJid, m.phone, true);
         imported++;
       }
     }
-
     stats.supabase_synced += imported;
-    console.log("[sync] Importados " + imported + " mapeamentos do Supabase (total no DB: " + mappings.length + ")");
-  } catch (e) {
-    console.error("[sync] Erro ao sincronizar cache:", e.message);
-  }
+    console.log("[sync] Importados " + imported + " mapeamentos (total DB: " + mappings.length + ")");
+  } catch (e) { console.error("[sync] Erro:", e.message); }
 }
 
 async function resolveFromSupabase(rawJid) {
-  const supabaseUrl = getSupabaseBaseUrl();
-  if (!supabaseUrl || !SUPABASE_ANON_KEY) return null;
-
+  if (!SUPABASE_URL || !SUPABASE_KEY) return null;
   try {
-    const cleanJid = rawJid.replace(/@.*$/, "").replace(/\D/g, "");
-
+    const cleanJid = rawJid.replace(/\D/g, "");
     const res = await fetch(
-      `${supabaseUrl}/rest/v1/jid_mappings?select=phone&jid=eq.${cleanJid}&limit=1`,
-      {
-        headers: {
-          "apikey": SUPABASE_ANON_KEY,
-          "Authorization": `Bearer ${SUPABASE_ANON_KEY}`,
-        },
-        signal: AbortSignal.timeout(5000),
-      }
+      SUPABASE_URL + "/rest/v1/jid_mappings?select=phone&jid=eq." + cleanJid + "&limit=1",
+      { headers: supabaseHeaders(), signal: AbortSignal.timeout(5000) }
     );
-
     if (!res.ok) return null;
     const data = await res.json();
-
     if (data?.[0]?.phone) {
-      console.log("[supabase-resolve] " + rawJid + " → " + data[0].phone);
       const fullJid = rawJid.includes("@") ? rawJid : rawJid + "@lid";
       cacheJidMapping(fullJid, data[0].phone, true);
       stats.supabase_resolved++;
+      console.log("[supabase-resolve] " + rawJid + " → " + data[0].phone);
       return data[0].phone;
     }
-  } catch (e) {
-    console.error("[supabase-resolve] Erro:", e.message);
-  }
-
+  } catch (e) { console.error("[supabase-resolve] Erro:", e.message); }
   return null;
 }
 
 // ═══════════════════════════════════════════════════════════
-//  DEDUPLICAÇÃO
+//  DEDUPLICAÇÃO — persistida em disco
 // ═══════════════════════════════════════════════════════════
 let processedMsgIds = {};
 
@@ -254,9 +229,7 @@ function loadDedup() {
     if (fs.existsSync(DEDUP_FILE)) {
       const raw = JSON.parse(fs.readFileSync(DEDUP_FILE, "utf8"));
       const now = Date.now();
-      for (const [id, exp] of Object.entries(raw)) {
-        if (exp > now) processedMsgIds[id] = exp;
-      }
+      for (const [id, exp] of Object.entries(raw)) { if (exp > now) processedMsgIds[id] = exp; }
       console.log("[dedup] Loaded " + Object.keys(processedMsgIds).length + " IDs");
     }
   } catch (_) {}
@@ -273,12 +246,9 @@ function saveDedup() {
 }
 
 setInterval(() => {
-  const now = Date.now();
-  let cleaned = 0;
-  for (const [id, exp] of Object.entries(processedMsgIds)) {
-    if (exp <= now) { delete processedMsgIds[id]; cleaned++; }
-  }
-  if (cleaned > 0) saveDedup();
+  const now = Date.now(); let c = 0;
+  for (const [id, exp] of Object.entries(processedMsgIds)) { if (exp <= now) { delete processedMsgIds[id]; c++; } }
+  if (c > 0) saveDedup();
 }, 5 * 60 * 1000);
 
 loadDedup();
@@ -287,24 +257,22 @@ function isDuplicate(msg) {
   const id = msg.key.id;
   if (!id) return false;
   const now = Date.now();
-  if (processedMsgIds[id] && processedMsgIds[id] > now) {
-    stats.dedup_dropped++;
-    return true;
-  }
+  if (processedMsgIds[id] && processedMsgIds[id] > now) { stats.dedup_dropped++; return true; }
   processedMsgIds[id] = now + 5 * 60 * 1000;
   saveDedup();
   return false;
 }
 
 // ═══════════════════════════════════════════════════════════
-//  FILA DE MENSAGENS
+//  FILA / WAL
 // ═══════════════════════════════════════════════════════════
 function enqueuePayload(payload) {
   fs.appendFile(QUEUE_FILE, JSON.stringify(payload) + "\n", () => {});
 }
 
 // ═══════════════════════════════════════════════════════════
-//  RATE LIMIT
+//  RATE LIMIT — queue independente por sessão
+//  Delay variável: anti-ban real (12. delay variável)
 // ═══════════════════════════════════════════════════════════
 const sendQueues  = {};
 const sendRunning = {};
@@ -321,13 +289,15 @@ async function processSendQueue(sessionId) {
   while (sendQueues[sessionId]?.length > 0) {
     const job = sendQueues[sessionId].shift();
     try { await job(); } catch (e) { console.error("[send-queue]", sessionId, e.message); }
-    await sleep(850);
+    // 12. Delay variável: simula comportamento humano, dificulta detecção
+    const delay = 800 + Math.random() * 400;   // 800–1200ms
+    await sleep(delay);
   }
   sendRunning[sessionId] = false;
 }
 
 // ═══════════════════════════════════════════════════════════
-//  WEBHOOK
+//  WEBHOOK — WAL antes de enviar, retry com backoff
 // ═══════════════════════════════════════════════════════════
 async function sendWebhook(payload, retries = 3) {
   if (!WEBHOOK_URL) return;
@@ -340,38 +310,33 @@ async function sendWebhook(payload, retries = 3) {
         body:    JSON.stringify(payload),
         signal:  AbortSignal.timeout(8000),
       });
-      if (res.ok) {
-        stats.webhook_ok++;
-        stats.queue_flushed++;
-        console.log("[webhook] " + payload.event + " ✓ (" + payload.session_id + ")");
-        return;
-      }
+      if (res.ok) { stats.webhook_ok++; stats.queue_flushed++; console.log("[webhook] " + payload.event + " ✓"); return; }
       console.warn("[webhook] HTTP " + res.status + " attempt " + attempt);
-    } catch (err) {
-      console.error("[webhook] attempt " + attempt + " failed:", err.message);
-    }
+    } catch (err) { console.error("[webhook] attempt " + attempt + ":", err.message); }
     if (attempt < retries) await sleep(attempt * 1200);
   }
   stats.webhook_fail++;
-  console.error("[webhook] All retries exhausted — persisted in " + QUEUE_FILE);
+  console.error("[webhook] Exhausted — persisted in " + QUEUE_FILE);
 }
 
 // ═══════════════════════════════════════════════════════════
 //  RESOLVE JID — phone → JID para ENVIO
+//  11. Validação de número antes de resolver
 // ═══════════════════════════════════════════════════════════
+function validatePhone(phone) {
+  const clean = phone.replace(/\D/g, "");
+  // Aceita: com DDI 55 (12-13 dígitos) ou sem (10-11 dígitos)
+  if (!/^\d{10,13}$/.test(clean)) throw new Error("Número inválido: " + phone);
+  return clean;
+}
+
 async function resolveJid(socket, phone) {
-  const cleanPhone = phone.replace(/\D/g, "");
-  if (phoneToJidMap[cleanPhone]) {
-    console.log("[jid] Cache: " + cleanPhone + " → " + phoneToJidMap[cleanPhone]);
-    return phoneToJidMap[cleanPhone];
-  }
+  const cleanPhone = validatePhone(phone);
+  if (phoneToJidMap[cleanPhone]) return phoneToJidMap[cleanPhone];
   for (const candidate of buildBRCandidates(cleanPhone)) {
     try {
       const result = await socket.onWhatsApp(candidate);
-      if (result?.[0]?.exists) {
-        cacheJidMapping(result[0].jid, cleanPhone, false);
-        return result[0].jid;
-      }
+      if (result?.[0]?.exists) { cacheJidMapping(result[0].jid, cleanPhone, false); return result[0].jid; }
     } catch (_) {}
   }
   return cleanPhone + "@s.whatsapp.net";
@@ -416,28 +381,23 @@ async function reverseResolvePhone(socket, jid) {
 
 async function resolveWithRetry(socket, jid, attempts = 5) {
   const rawJid = jid.replace(/@.*$/, "");
-
-  // Tentativa 1: cache local com backoff
   for (let i = 0; i < attempts; i++) {
     const cached = phoneFromMap(rawJid);
     if (cached) { stats.lid_resolved++; return cached; }
     console.log("[retry] LID " + rawJid + " tentativa " + (i + 1) + "/" + attempts);
-    await sleep(1000 * (i + 1));
+    await sleep(1000 * (i + 1));   // 1s, 2s, 3s, 4s, 5s → até 15s
   }
-
-  // Tentativa 2: consulta direta ao Supabase
+  // Fallback: Supabase
   const supabasePhone = await resolveFromSupabase(rawJid);
-  if (supabasePhone) {
-    stats.lid_resolved++;
-    return supabasePhone;
-  }
-
+  if (supabasePhone) { stats.lid_resolved++; return supabasePhone; }
   return reverseResolvePhone(socket, jid);
 }
 
 // ═══════════════════════════════════════════════════════════
-//  MESSAGE PARSING — unwrap + extractRealJid corrigido
+//  MESSAGE PARSING
 // ═══════════════════════════════════════════════════════════
+
+// Desempacota mensagens encapsuladas (ephemeral, viewOnce, etc.)
 function unwrapMessage(msgNode) {
   if (!msgNode || typeof msgNode !== "object") return msgNode;
   const inner =
@@ -451,45 +411,30 @@ function unwrapMessage(msgNode) {
   return inner ? unwrapMessage(inner) : msgNode;
 }
 
-function findContextParticipant(msgNode) {
-  if (!msgNode || typeof msgNode !== "object") return null;
-  for (const key of Object.keys(msgNode)) {
-    const val = msgNode[key];
-    if (val && typeof val === "object" && typeof val.contextInfo?.participant === "string") {
-      return val.contextInfo.participant;
-    }
-  }
-  return null;
-}
-
+// ─── REGRA FUNDAMENTAL DE EXTRAÇÃO DE JID ────────────────────────────────────
+//
+//  CORRETO:
+//    grupo  → msg.key.participant         (quem falou no grupo)
+//    direto → msg.key.remoteJid           (o contato)
+//
+//  ERRADO (não fazer):
+//    contextInfo.participant como prioridade máxima — aponta para o AUTOR
+//    DA MENSAGEM CITADA num reply, não para quem está enviando agora.
+//    Usar isso faz o reply ser atribuído ao contato errado.
+//
+//  O v8 inverteu essa lógica e foi a causa do bug de hoje.
+// ─────────────────────────────────────────────────────────────────────────────
 function extractRealJid(msg) {
-  const m = unwrapMessage(msg.message);
+  const topicJid = msg.key.remoteJid || "";
 
-  // 1. PRIORIDADE MÁXIMA: contextInfo.participant (reply com número real)
-  const ctxParticipant = findContextParticipant(m);
-  if (ctxParticipant && ctxParticipant.endsWith("@s.whatsapp.net")) {
-    console.log("[extractRealJid] Resolved via contextInfo.participant: " + ctxParticipant);
-    return ctxParticipant;
-  }
-
-  // 2. key.participant
-  if (msg.key.participant && msg.key.participant.endsWith("@s.whatsapp.net")) {
-    console.log("[extractRealJid] Resolved via key.participant: " + msg.key.participant);
+  // Grupo: participant é quem enviou; remoteJid é o grupo
+  if (topicJid.endsWith("@g.us") && msg.key.participant) {
     return msg.key.participant;
   }
 
-  // 3. remoteJid se for @s.whatsapp.net válido
-  const remoteJid = msg.key.remoteJid || "";
-  if (remoteJid.endsWith("@s.whatsapp.net")) {
-    const digits = remoteJid.replace(/@.*$/, "");
-    if (/^\d{10,13}$/.test(digits)) {
-      return remoteJid;
-    }
-  }
-
-  // 4. Fallback (pode ser LID — será resolvido via cache/retry/supabase)
-  console.log("[extractRealJid] Fallback to remoteJid: " + remoteJid);
-  return remoteJid || null;
+  // Chat direto (inclui replies): remoteJid é sempre o remetente.
+  // NÃO usamos contextInfo.participant aqui.
+  return topicJid || null;
 }
 
 function extractText(msg) {
@@ -515,7 +460,17 @@ function extractText(msg) {
 
 // ═══════════════════════════════════════════════════════════
 //  SESSION FACTORY
+//  10. Backoff exponencial POR SESSÃO na reconexão
 // ═══════════════════════════════════════════════════════════
+const reconnectRetries = {};   // sessionId → contagem de retries
+
+function getReconnectDelay(sessionId) {
+  const retries = reconnectRetries[sessionId] || 0;
+  reconnectRetries[sessionId] = retries + 1;
+  // Backoff: 3s, 6s, 12s, 24s, 30s (cap)
+  return Math.min(30000, 3000 * Math.pow(2, retries));
+}
+
 async function createSession(sessionId) {
   if (sessions[sessionId]?.socket) return sessions[sessionId];
 
@@ -546,10 +501,9 @@ async function createSession(sessionId) {
     if (connection === "open") {
       session.qr = null; session.connected = true;
       session.phone = socket.user?.id?.split(":")[0] || null;
+      reconnectRetries[sessionId] = 0;   // reset backoff ao conectar com sucesso
       console.log("[connected] " + sessionId + " (" + session.phone + ")");
       await sendWebhook({ event: "connected", session_id: sessionId, connected: true, phone_number: session.phone });
-
-      // Sincroniza cache com Supabase ao conectar
       await syncCacheFromSupabase();
     }
     if (connection === "close") {
@@ -559,9 +513,12 @@ async function createSession(sessionId) {
       await sendWebhook({ event: "disconnected", session_id: sessionId, connected: false, reason: shouldReconnect ? "connection_lost" : "logged_out" });
       if (shouldReconnect) {
         delete sessions[sessionId];
-        setTimeout(() => createSession(sessionId), 3000);
+        const delay = getReconnectDelay(sessionId);
+        console.log("[reconnect] " + sessionId + " em " + (delay / 1000) + "s (retry #" + reconnectRetries[sessionId] + ")");
+        setTimeout(() => createSession(sessionId), delay);
       } else {
         delete sessions[sessionId];
+        reconnectRetries[sessionId] = 0;
         try { fs.rmSync(sessionDir, { recursive: true, force: true }); } catch (_) {}
       }
     }
@@ -569,14 +526,10 @@ async function createSession(sessionId) {
 
   socket.ev.on("creds.update", saveCreds);
 
-  // ═══════════════════════════════════════════════════════
-  //  messages.upsert — extractRealJid + cache auto de LID
-  // ═══════════════════════════════════════════════════════
   socket.ev.on("messages.upsert", async ({ type, messages }) => {
     if (type !== "notify") return;
     for (const msg of messages) {
       if (msg.key.fromMe || !msg.message) continue;
-
       if (isDuplicate(msg)) { console.log("[dedup] Dropped: " + msg.key.id); continue; }
 
       const topicJid = msg.key.remoteJid || "";
@@ -584,6 +537,7 @@ async function createSession(sessionId) {
 
       stats.messages_received++;
 
+      // EXTRAÇÃO CORRETA: nunca usa contextInfo.participant como remetente
       const remoteJid = extractRealJid(msg) || topicJid;
       let phone = await reverseResolvePhone(socket, remoteJid);
 
@@ -598,13 +552,11 @@ async function createSession(sessionId) {
         }
       }
 
-      // Cache automático: se remoteJid original era LID mas resolvemos o phone
-      const originalRemoteJid = msg.key.remoteJid || "";
-      const originalRawJid = originalRemoteJid.replace(/@.*$/, "");
-      const cleanPhone = phone.replace(/\D/g, "");
-      if (originalRawJid && originalRawJid !== cleanPhone && originalRemoteJid.endsWith("@lid")) {
-        cacheJidMapping(originalRemoteJid, cleanPhone, true);
-        console.log("[cache] LID auto-cached: " + originalRawJid + " → " + cleanPhone);
+      // Auto-cache: se remoteJid original era @lid e agora temos o phone
+      const origRemoteJid = msg.key.remoteJid || "";
+      if (origRemoteJid.endsWith("@lid")) {
+        const cleanPhone = phone.replace(/\D/g, "");
+        cacheJidMapping(origRemoteJid, cleanPhone, true);
       }
 
       const text = extractText(msg);
@@ -634,6 +586,7 @@ async function createSession(sessionId) {
   return session;
 }
 
+// 9. message_id no payload para idempotência no backend
 async function dispatchMessage(sessionId, phone, remoteJid, text, msg) {
   const rawJid     = remoteJid.replace(/@.*$/, "");
   const jidType    = remoteJid.endsWith("@lid") ? "lid" : "phone";
@@ -647,6 +600,7 @@ async function dispatchMessage(sessionId, phone, remoteJid, text, msg) {
     real_phone: cleanPhone,
     message:    text,
     from:       cleanPhone,
+    message_id: msg.key.id,          // 9. idempotência: backend ignora duplicados pelo ID
     raw_jid:    rawJid,
     jid_type:   jidType,
     key: {
@@ -663,14 +617,26 @@ function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
 //  ROUTES
 // ═══════════════════════════════════════════════════════════
 
-app.get("/", (_, res) => res.json({ status: "ok", version: "v8", sessions: Object.keys(sessions).length, cache_size: Object.keys(jidToPhoneMap).length }));
+app.get("/", (_, res) => res.json({ status: "ok", version: "v9", sessions: Object.keys(sessions).length, cache_size: Object.keys(jidToPhoneMap).length }));
+
+// 13. /health com HTTP 503 quando sem sessão conectada (Railway healthcheck)
+app.get("/health", (_, res) => {
+  const connected = Object.values(sessions).filter((s) => s.connected);
+  const ok        = connected.length > 0;
+  res.status(ok ? 200 : 503).json({
+    status:            ok ? "healthy" : "degraded",
+    connected_sessions:connected.length,
+    total_sessions:    Object.keys(sessions).length,
+  });
+});
 
 app.get("/stats", (_, res) => res.json({
   ...stats,
-  uptime_s:         Math.floor(process.uptime()),
-  cache_size:       Object.keys(jidToPhoneMap).length,
-  dedup_active_ids: Object.keys(processedMsgIds).length,
-  send_queues:      Object.fromEntries(Object.entries(sendQueues).map(([sid, q]) => [sid, q.length])),
+  uptime_s:          Math.floor(process.uptime()),
+  cache_size:        Object.keys(jidToPhoneMap).length,
+  dedup_active_ids:  Object.keys(processedMsgIds).length,
+  send_queues:       Object.fromEntries(Object.entries(sendQueues).map(([sid, q]) => [sid, q.length])),
+  reconnect_retries: { ...reconnectRetries },
 }));
 
 app.get("/cache", (_, res) => res.json({ jid_to_phone: jidToPhoneMap, phone_to_jid: phoneToJidMap, migrations: jidMigrationLog }));
@@ -694,28 +660,35 @@ app.delete("/session/:id", async (req, res) => {
   const session   = sessions[sessionId];
   if (session?.socket) { try { await session.socket.logout(); } catch (_) { try { session.socket.end(); } catch (_) {} } }
   delete sessions[sessionId];
+  reconnectRetries[sessionId] = 0;
   const dir = path.join(AUTH_DIR, sessionId);
   try { if (fs.existsSync(dir)) fs.rmSync(dir, { recursive: true, force: true }); } catch (_) {}
   res.json({ success: true });
 });
 
+// 11. Validação + rate limit por sessão
 app.post("/send", async (req, res) => {
   try {
     const { session_id, phone, message } = req.body;
     if (!phone || !message) return res.status(400).json({ error: "phone and message required" });
+
+    let cleanPhone;
+    try { cleanPhone = validatePhone(phone); }
+    catch (e) { return res.status(400).json({ error: e.message }); }
+
     const sid     = session_id || Object.keys(sessions)[0];
     const session = sessions[sid];
     if (!session?.connected) return res.status(400).json({ error: "Session " + sid + " not connected" });
 
-    const jid = await resolveJid(session.socket, phone);
-    res.json({ success: true, session_id: sid, phone, jid, queued: true });
+    const jid = await resolveJid(session.socket, cleanPhone);
+    res.json({ success: true, session_id: sid, phone: cleanPhone, jid, queued: true });
 
     enqueueSend(sid, async () => {
       const result = await session.socket.sendMessage(jid, { text: message });
       if (result?.key?.remoteJid) {
-        const { migrated, previousJid } = cacheJidMapping(result.key.remoteJid, phone, true);
+        const { migrated, previousJid } = cacheJidMapping(result.key.remoteJid, cleanPhone, true);
         if (migrated) {
-          await sendWebhook({ event: "jid_migrated", session_id: sid, phone: phone.replace(/\D/g, ""), previous_jid: previousJid, current_jid: result.key.remoteJid, migrated_at: new Date().toISOString() });
+          await sendWebhook({ event: "jid_migrated", session_id: sid, phone: cleanPhone, previous_jid: previousJid, current_jid: result.key.remoteJid, migrated_at: new Date().toISOString() });
         }
       }
     });
@@ -727,21 +700,26 @@ app.post("/send-file", async (req, res) => {
     const { session_id, phone, file_url, caption = "" } = req.body;
     const file_name = req.body.file_name || "file";
     if (!phone || !file_url) return res.status(400).json({ error: "phone and file_url required" });
+
+    let cleanPhone;
+    try { cleanPhone = validatePhone(phone); }
+    catch (e) { return res.status(400).json({ error: e.message }); }
+
     const sid     = session_id || Object.keys(sessions)[0];
     const session = sessions[sid];
     if (!session?.connected) return res.status(400).json({ error: "Session " + sid + " not connected" });
 
-    const jid = await resolveJid(session.socket, phone);
+    const jid = await resolveJid(session.socket, cleanPhone);
     const ext = file_name.split(".").pop().toLowerCase();
     let msgContent;
     if (["jpg","jpeg","png","gif","webp"].includes(ext))  msgContent = { image: { url: file_url }, caption };
     else if (["mp4","mov","avi","mkv"].includes(ext))      msgContent = { video: { url: file_url }, caption };
     else msgContent = { document: { url: file_url }, fileName: file_name, mimetype: "application/octet-stream", caption };
 
-    res.json({ success: true, session_id: sid, phone, file_name, jid, queued: true });
+    res.json({ success: true, session_id: sid, phone: cleanPhone, file_name, jid, queued: true });
     enqueueSend(sid, async () => {
       const result = await session.socket.sendMessage(jid, msgContent);
-      if (result?.key?.remoteJid) cacheJidMapping(result.key.remoteJid, phone, true);
+      if (result?.key?.remoteJid) cacheJidMapping(result.key.remoteJid, cleanPhone, true);
     });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
@@ -770,11 +748,11 @@ process.on("SIGINT",  () => shutdown("SIGINT"));
 
 // ── Start ─────────────────────────────────────────────────
 app.listen(PORT, () => {
-  console.log("Gorilla Spam v8 — port " + PORT);
-  console.log("Webhook:      " + (WEBHOOK_URL || "NOT SET"));
-  console.log("Supabase key: " + (SUPABASE_ANON_KEY ? "SET" : "NOT SET"));
-  console.log("Cache:        " + CACHE_FILE);
-  console.log("Queue log:    " + QUEUE_FILE);
+  console.log("Gorilla Spam v9 — port " + PORT);
+  console.log("Webhook:   " + (WEBHOOK_URL    || "NOT SET"));
+  console.log("Supabase:  " + (SUPABASE_URL   ? "SET" : "NOT SET"));
+  console.log("Cache:     " + CACHE_FILE);
+  console.log("Queue log: " + QUEUE_FILE);
   if (fs.existsSync(AUTH_DIR)) {
     const dirs = fs.readdirSync(AUTH_DIR).filter((d) => fs.statSync(path.join(AUTH_DIR, d)).isDirectory());
     console.log("Restoring " + dirs.length + " session(s)...");

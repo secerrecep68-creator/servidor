@@ -1,18 +1,16 @@
 {
-  "name": "baileys-whatsapp-server",
+  "name": "gorilla-spam-baileys",
   "version": "1.0.0",
-  "description": "Servidor WhatsApp multi-sessão com Baileys",
-  "main": "src/index.js",
+  "description": "Gorilla Spam - WhatsApp Baileys Server",
+  "main": "baileys-server.js",
   "scripts": {
-    "start": "node src/index.js",
-    "dev": "node --watch src/index.js"
+    "start": "node baileys-server.js"
   },
   "dependencies": {
-    "@hapi/boom": "^10.0.1",
     "@whiskeysockets/baileys": "^6.7.16",
+    "express": "^4.21.0",
     "cors": "^2.8.5",
-    "express": "^4.21.2",
     "pino": "^9.6.0",
-    "qrcode": "^1.5.4"
+    "axios": "^1.7.9"
   }
 }

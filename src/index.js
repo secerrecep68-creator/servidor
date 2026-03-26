@@ -1,30 +1,6 @@
 // ============================================================
 // GORILLA SPAM - Baileys Server (v9 - MERGE CORRETO)
 // ============================================================
-// v8 trouxe boas adições (Supabase sync, unwrapMessage, extractText expandido)
-// mas quebrou extractRealJid com lógica invertida de contextInfo.participant.
-// Este v9 corrige isso e restaura os itens que foram perdidos no v8.
-//
-// REGRA FUNDAMENTAL (não mudar):
-//   grupo  → msg.key.participant         (quem falou no grupo)
-//   direto → msg.key.remoteJid           (o contato em si)
-//   contextInfo.participant → JAMAIS     (é o autor da msg CITADA, não o remetente)
-//
-// Adições do v8 mantidas:
-//   + Supabase sync no boot (syncCacheFromSupabase)
-//   + resolveFromSupabase como fallback de LID
-//   + unwrapMessage (ephemeral, viewOnce, etc.)
-//   + extractText expandido (botões, listas, interactivo)
-//   + real_phone + key no payload do webhook
-//   + LID auto-cache após resolução
-//
-// Restaurado do v7 (estava faltando no v8):
-//   + Backoff exponencial POR SESSÃO na reconexão
-//   + Validação de número antes de enviar (/send)
-//   + /health com HTTP 503 quando sem sessão
-//   + Delay variável anti-ban (800 + random)
-//   + message_id no payload (idempotência backend)
-// ============================================================
 
 const express = require("express");
 const {

@@ -21,7 +21,9 @@ const PORT            = process.env.PORT || 3000;
 const WEBHOOK_URL     = process.env.WEBHOOK_URL;
 const SUPABASE_URL    = process.env.SUPABASE_URL    || "";
 const SUPABASE_KEY    = process.env.SUPABASE_ANON_KEY || "";
-const AUTH_DIR        = path.join(__dirname, "..", "auth_sessions");
+const AUTH_DIR = fs.existsSync("/data")
+  ? path.join("/data", "auth_sessions")
+  : path.join(__dirname, "..", "auth_sessions");
 const CACHE_DIR       = fs.existsSync("/data") ? "/data" : __dirname;
 const CACHE_FILE      = path.join(CACHE_DIR, "jid_cache.json");
 const DEDUP_FILE      = path.join(CACHE_DIR, "dedup.json");

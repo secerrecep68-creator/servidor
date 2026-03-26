@@ -1,9 +1,13 @@
 // ============================================================
-// GORILLA SPAM - Baileys Server (v4 - LID FIX PERSISTENTE)
+// GORILLA SPAM - Baileys Server (v5 - JID EXTRACTION FIX)
 // Fixes:
 //   1. Cache JID↔Phone persistido em disco (sobrevive restarts)
 //   2. onWhatsApp() NÃO resolve LID — removida chamada inútil
 //   3. Webhook bloqueado se LID não foi resolvido (evita descarte)
+//   4. extractRealJid() extrai o JID do REMETENTE corretamente
+//      — grupo: msg.key.participant tem precedência sobre remoteJid
+//      — direto/reply: remoteJid é sempre o remetente; contextInfo.participant
+//        aponta para quem foi CITADO, não quem enviou — ignorado aqui
 // ============================================================
 
 const express = require("express");
@@ -291,8 +295,17 @@ async function createSession(sessionId) {
       if (msg.key.fromMe) continue;
       if (!msg.message) continue;
 
-      const remoteJid = msg.key.remoteJid || "";
-      if (!remoteJid || remoteJid === "status@broadcast" || remoteJid.endsWith("@g.us")) continue;
+      const topicJid = msg.key.remoteJid || "";
+      if (!topicJid || topicJid === "status@broadcast") continue;
+      // Grupos: filtra aqui (remova esse continue para suportar grupos no futuro)
+      if (topicJid.endsWith("@g.us")) continue;
+
+      // JID do remetente real:
+      //   grupo  → msg.key.participant (quem falou)
+      //   direto → msg.key.remoteJid   (o próprio contato)
+      // contextInfo.participant NÃO é usado aqui — identifica o autor da msg CITADA,
+      // não de quem está enviando.
+      const remoteJid = extractRealJid(msg) || topicJid;
 
       // ═══ CRÍTICO: resolve phone; se LID não resolvido, suprime webhook ═══
       const phone = await reverseResolvePhone(socket, remoteJid);
@@ -357,6 +370,27 @@ async function createSession(sessionId) {
   });
 
   return session;
+}
+
+// ═══ Extrai o JID do REMETENTE real da mensagem ═══
+//
+// Regra:
+//   - Grupos  → msg.key.participant  (quem falou dentro do grupo)
+//   - Direto  → msg.key.remoteJid   (o próprio contato)
+//
+// NÃO usamos contextInfo.participant aqui porque ele identifica o autor
+// da mensagem CITADA num reply, não quem está enviando a mensagem atual.
+// Usar esse campo como remetente causaria atribuição incorreta.
+function extractRealJid(msg) {
+  const isGroup = msg.key.remoteJid && msg.key.remoteJid.endsWith("@g.us");
+
+  // Grupo: participante é quem enviou; remoteJid é o grupo
+  if (isGroup && msg.key.participant) {
+    return msg.key.participant;
+  }
+
+  // Direto (inclui replies): remoteJid é sempre o remetente
+  return msg.key.remoteJid || null;
 }
 
 function extractText(msg) {

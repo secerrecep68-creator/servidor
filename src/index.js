@@ -19,7 +19,15 @@ app.use(express.json({ limit: "10mb" }));
 
 const PORT            = process.env.PORT || 3000;
 const WEBHOOK_URL     = process.env.WEBHOOK_URL;
-const SUPABASE_URL    = process.env.SUPABASE_URL    || "";
+function extractSupabaseUrl() {
+  if (!WEBHOOK_URL) return "";
+  // Extract base URL from WEBHOOK_URL
+  // e.g., https://xxx.supabase.co/functions/v1/webhook-incoming → https://xxx.supabase.co
+  const match = WEBHOOK_URL.match(/^(https:\/\/[^/]+)/);
+  return match ? match[1] : "";
+}
+
+const SUPABASE_URL = extractSupabaseUrl();
 const SUPABASE_KEY    = process.env.SUPABASE_ANON_KEY || "";
 const AUTH_DIR        = path.join(__dirname, "..", "auth_sessions");
 const CACHE_DIR       = fs.existsSync("/data") ? "/data" : __dirname;

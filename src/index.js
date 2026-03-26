@@ -327,14 +327,102 @@ async function reverseResolvePhone(socket, jid) {
   return rawJid;
 }
 
+// ═══════════════════════════════════════════════════════════
+//  SUPABASE INTEGRATION — remote JID mapping source of truth
+// ═══════════════════════════════════════════════════════════
+
+function getSupabaseBase() {
+  if (!WEBHOOK_URL) return null;
+  // Strip /functions/v1/... path to get the Supabase project base URL
+  const match = WEBHOOK_URL.match(/^(https:\/\/[^/]+)/);
+  return match ? match[1] : null;
+}
+
+async function syncCacheFromSupabase() {
+  const supabaseUrl = getSupabaseBase();
+  const anonKey    = process.env.SUPABASE_ANON_KEY;
+  if (!supabaseUrl || !anonKey) {
+    console.warn("[supabase-sync] Skipped — WEBHOOK_URL or SUPABASE_ANON_KEY not set");
+    return;
+  }
+  try {
+    const url = supabaseUrl + "/rest/v1/jid_mappings?select=jid,phone,jid_type&order=updated_at.desc&limit=500";
+    const res = await fetch(url, {
+      headers: {
+        "apikey":        anonKey,
+        "Authorization": "Bearer " + anonKey,
+      },
+      signal: AbortSignal.timeout(10000),
+    });
+    if (!res.ok) {
+      console.warn("[supabase-sync] HTTP " + res.status + " — skipping sync");
+      return;
+    }
+    const rows = await res.json();
+    let imported = 0;
+    for (const row of rows) {
+      if (!row.jid || !row.phone) continue;
+      const rawJid = row.jid.replace(/@.*$/, "");
+      // Only import mappings not already present in local cache
+      if (!jidToPhoneMap[rawJid]) {
+        const confirmed = row.jid_type === "lid";
+        jidToPhoneMap[rawJid]              = { phone: row.phone, ts: Date.now(), confirmed };
+        phoneToJidMap[row.phone]           = phoneToJidMap[row.phone] || row.jid;
+        imported++;
+      }
+    }
+    if (imported > 0) saveCache();
+    console.log("[supabase-sync] Imported " + imported + " mappings from Supabase (" + rows.length + " fetched)");
+  } catch (err) {
+    console.warn("[supabase-sync] Error during sync:", err.message);
+  }
+}
+
+async function resolveFromSupabase(rawJid) {
+  const supabaseUrl = getSupabaseBase();
+  const anonKey    = process.env.SUPABASE_ANON_KEY;
+  if (!supabaseUrl || !anonKey) return null;
+  try {
+    const cleanJid = rawJid.includes("@") ? rawJid : rawJid;
+    const url = supabaseUrl + "/rest/v1/jid_mappings?select=phone&jid=eq." + encodeURIComponent(cleanJid) + "&limit=1";
+    const res = await fetch(url, {
+      headers: {
+        "apikey":        anonKey,
+        "Authorization": "Bearer " + anonKey,
+      },
+      signal: AbortSignal.timeout(5000),
+    });
+    if (!res.ok) return null;
+    const rows = await res.json();
+    if (!rows?.length || !rows[0].phone) return null;
+    const phone = rows[0].phone;
+    // Cache the resolved mapping locally for future lookups
+    const jidFull = cleanJid.includes("@") ? cleanJid : cleanJid + "@lid";
+    cacheJidMapping(jidFull, phone, true);
+    console.log("[supabase-resolve] " + rawJid + " → " + phone);
+    return phone;
+  } catch (err) {
+    console.warn("[supabase-resolve] Error:", err.message);
+    return null;
+  }
+}
+
 async function resolveWithRetry(socket, jid, attempts = 5) {
   const rawJid = jid.replace(/@.*$/, "");
+
+  // Tier 1: local cache with retries + backoff
   for (let i = 0; i < attempts; i++) {
     const cached = phoneFromMap(rawJid);
     if (cached) { stats.lid_resolved++; return cached; }
     console.log("[retry] LID " + rawJid + " tentativa " + (i + 1) + "/" + attempts);
     await sleep(1000 * (i + 1));
   }
+
+  // Tier 2: Supabase remote lookup
+  const fromSupabase = await resolveFromSupabase(jid);
+  if (fromSupabase) { stats.lid_resolved++; return fromSupabase; }
+
+  // Tier 3: WhatsApp onWhatsApp reverse lookup (last resort)
   return reverseResolvePhone(socket, jid);
 }
 
@@ -455,6 +543,7 @@ async function createSession(sessionId) {
       session.phone = socket.user?.id?.split(":")[0] || null;
       console.log("[connected] " + sessionId + " (" + session.phone + ")");
       await sendWebhook({ event: "connected", session_id: sessionId, connected: true, phone_number: session.phone });
+      await syncCacheFromSupabase();
     }
     if (connection === "close") {
       session.connected = false;

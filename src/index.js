@@ -337,7 +337,25 @@ async function resolveJid(socket, phone) {
   for (const candidate of buildBRCandidates(cleanPhone)) {
     try {
       const result = await socket.onWhatsApp(candidate);
-      if (result?.[0]?.exists) { cacheJidMapping(result[0].jid, cleanPhone, false); return result[0].jid; }
+      if (result?.[0]?.exists) {
+        const jid = result[0].jid;
+        cacheJidMapping(jid, cleanPhone, false);
+        await upsertSupabaseMapping(jid, cleanPhone, "phone");
+
+        // ─── CAPTURA O LID retornado pelo onWhatsApp ───────────
+        // O Baileys inclui o campo `lid` quando disponível.
+        // Salvar agora garante que a resposta do cliente seja resolvida
+        // mesmo que ele use @lid em vez de @s.whatsapp.net.
+        const lid = result[0].lid;
+        if (lid) {
+          const lidFull = lid.endsWith("@lid") ? lid : lid + "@lid";
+          cacheJidMapping(lidFull, cleanPhone, true);
+          await upsertSupabaseMapping(lidFull, cleanPhone, "lid");
+          console.log("[resolve-lid] " + cleanPhone + " → " + lidFull);
+        }
+
+        return jid;
+      }
     } catch (_) {}
   }
   return cleanPhone + "@s.whatsapp.net";

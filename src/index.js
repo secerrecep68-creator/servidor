@@ -1,5 +1,19 @@
 // ============================================================
-// GORILLA SPAM - Baileys Server (v9 - MERGE CORRETO)
+// GORILLA SPAM - Baileys Server (v10 - 4 FIXES)
+//
+// FIX 1: Resync de chaves após stream errored out
+//        — ao reconectar, força limpeza de sessão corrompida
+//        — mensagens decrypt-fail são logadas com aviso claro
+//
+// FIX 2: Retry de mensagens _unresolved do queue.log
+//        — ao conectar, relê queue.log e retenta mensagens perdidas
+//        — após retentar com sucesso, remove do arquivo
+//
+// FIX 3: Alerta de stream errored out via webhook
+//        — envia evento "stream_error" ao webhook para notificação
+//
+// FIX 4: Contador de decrypt failures com alerta automático
+//        — após 3 falhas consecutivas, força resync de sessão
 // ============================================================
 
 const express = require("express");
@@ -36,19 +50,25 @@ const sessions = {};
 //  MÉTRICAS
 // ═══════════════════════════════════════════════════════════
 const stats = {
-  messages_received:   0,
-  messages_dispatched: 0,
-  lid_unresolved:      0,
-  lid_resolved:        0,
-  lid_migrations:      0,
-  dedup_dropped:       0,
-  webhook_ok:          0,
-  webhook_fail:        0,
-  queue_flushed:       0,
-  supabase_synced:     0,
-  supabase_resolved:   0,
-  started_at:          new Date().toISOString(),
+  messages_received:    0,
+  messages_dispatched:  0,
+  lid_unresolved:       0,
+  lid_resolved:         0,
+  lid_migrations:       0,
+  dedup_dropped:        0,
+  webhook_ok:           0,
+  webhook_fail:         0,
+  queue_flushed:        0,
+  supabase_synced:      0,
+  supabase_resolved:    0,
+  decrypt_failures:     0,   // FIX 4
+  stream_errors:        0,   // FIX 3
+  unresolved_retried:   0,   // FIX 2
+  started_at:           new Date().toISOString(),
 };
+
+// FIX 4: contador de decrypt failures consecutivos por sessão
+const decryptFailures = {};  // sessionId → count
 
 // ═══════════════════════════════════════════════════════════
 //  CACHE JID — com TTL seletivo
@@ -136,7 +156,6 @@ function cacheJidMapping(jid, phone, confirmed = false) {
   if (previousRaw && previousRaw !== rawJid)
     jidToPhoneMap[previousRaw]  = { phone: cleanPhone, ts: Date.now(), confirmed: true };
 
-  // Cache duplo: ao cachear @lid, garante que forma numérica pura também existe
   if (jid.endsWith("@lid") && /^\d+$/.test(cleanPhone) && !jidToPhoneMap[cleanPhone])
     jidToPhoneMap[cleanPhone]   = { phone: cleanPhone, ts: Date.now(), confirmed: true };
 
@@ -197,7 +216,6 @@ async function resolveFromSupabase(rawJid) {
   return null;
 }
 
-// ─── NOVO: persiste mapeamento no Supabase ────────────────
 async function upsertSupabaseMapping(jid, phone, jidType = "phone") {
   if (!SUPABASE_URL || !SUPABASE_KEY) return;
   try {
@@ -218,6 +236,61 @@ async function upsertSupabaseMapping(jid, phone, jidType = "phone") {
     });
     console.log("[supabase-upsert] " + jid + " → " + phone);
   } catch (e) { console.error("[supabase-upsert]", e.message); }
+}
+
+// ═══════════════════════════════════════════════════════════
+//  FIX 2 — RETRY DE MENSAGENS UNRESOLVED DO QUEUE.LOG
+// ═══════════════════════════════════════════════════════════
+async function retryUnresolvedQueue(socket, sessionId) {
+  if (!fs.existsSync(QUEUE_FILE)) return;
+  let lines;
+  try { lines = fs.readFileSync(QUEUE_FILE, "utf8").split("\n").filter(Boolean); }
+  catch (e) { console.error("[queue-retry] Erro ao ler fila:", e.message); return; }
+
+  if (!lines.length) return;
+
+  const kept = [];
+
+  for (const line of lines) {
+    let entry;
+    try { entry = JSON.parse(line); } catch (_) { continue; }
+
+    if (!entry._unresolved) { kept.push(line); continue; }
+
+    const jid  = entry.jid;
+    const text = entry.text;
+    const sid  = entry.session_id || sessionId;
+
+    if (!jid || !text) { kept.push(line); continue; }
+
+    let phone = await resolveWithRetry(socket, jid, 2);
+    if (!phone) phone = await resolveFromSupabase(jid.replace(/@.*$/, ""));
+
+    if (phone) {
+      stats.unresolved_retried++;
+      console.log("[queue-retry] Resolvido: " + jid + " → " + phone);
+      await sendWebhook({
+        event:        "message",
+        session_id:   sid,
+        phone:        phone.replace(/\D/g, ""),
+        real_phone:   phone.replace(/\D/g, ""),
+        message:      text,
+        from:         phone.replace(/\D/g, ""),
+        raw_jid:      jid.replace(/@.*$/, ""),
+        jid_type:     jid.endsWith("@lid") ? "lid" : "phone",
+        _retried:     true,
+        _original_ts: entry.ts,
+      });
+      // não adiciona em kept — foi resolvido, sai da fila
+    } else {
+      kept.push(line); // ainda não resolvido, mantém
+    }
+  }
+
+  try {
+    fs.writeFileSync(QUEUE_FILE, kept.join("\n") + (kept.length ? "\n" : ""), "utf8");
+    console.log("[queue-retry] Fila: " + kept.filter(l => { try { return JSON.parse(l)._unresolved; } catch(_){return false;} }).length + " pendente(s)");
+  } catch (e) { console.error("[queue-retry] Erro ao salvar fila:", e.message); }
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -273,7 +346,6 @@ function enqueuePayload(payload) {
 
 // ═══════════════════════════════════════════════════════════
 //  RATE LIMIT — queue independente por sessão
-//  Delay variável: anti-ban real (12. delay variável)
 // ═══════════════════════════════════════════════════════════
 const sendQueues  = {};
 const sendRunning = {};
@@ -290,15 +362,14 @@ async function processSendQueue(sessionId) {
   while (sendQueues[sessionId]?.length > 0) {
     const job = sendQueues[sessionId].shift();
     try { await job(); } catch (e) { console.error("[send-queue]", sessionId, e.message); }
-    // 12. Delay variável: simula comportamento humano, dificulta detecção
-    const delay = 800 + Math.random() * 400;   // 800–1200ms
+    const delay = 800 + Math.random() * 400;
     await sleep(delay);
   }
   sendRunning[sessionId] = false;
 }
 
 // ═══════════════════════════════════════════════════════════
-//  WEBHOOK — WAL antes de enviar, retry com backoff
+//  WEBHOOK
 // ═══════════════════════════════════════════════════════════
 async function sendWebhook(payload, retries = 3) {
   if (!WEBHOOK_URL) return;
@@ -321,12 +392,10 @@ async function sendWebhook(payload, retries = 3) {
 }
 
 // ═══════════════════════════════════════════════════════════
-//  RESOLVE JID — phone → JID para ENVIO
-//  11. Validação de número antes de resolver
+//  RESOLVE JID
 // ═══════════════════════════════════════════════════════════
 function validatePhone(phone) {
   const clean = phone.replace(/\D/g, "");
-  // Aceita: com DDI 55 (12-13 dígitos) ou sem (10-11 dígitos)
   if (!/^\d{10,13}$/.test(clean)) throw new Error("Número inválido: " + phone);
   return clean;
 }
@@ -342,10 +411,7 @@ async function resolveJid(socket, phone) {
         cacheJidMapping(jid, cleanPhone, false);
         await upsertSupabaseMapping(jid, cleanPhone, "phone");
 
-        // ─── CAPTURA O LID retornado pelo onWhatsApp ───────────
-        // O Baileys inclui o campo `lid` quando disponível.
-        // Salvar agora garante que a resposta do cliente seja resolvida
-        // mesmo que ele use @lid em vez de @s.whatsapp.net.
+        // Captura LID retornado pelo onWhatsApp
         const lid = result[0].lid;
         if (lid) {
           const lidFull = lid.endsWith("@lid") ? lid : lid + "@lid";
@@ -369,7 +435,7 @@ function buildBRCandidates(p) {
 }
 
 // ═══════════════════════════════════════════════════════════
-//  REVERSE RESOLVE — JID/LID → phone
+//  REVERSE RESOLVE
 // ═══════════════════════════════════════════════════════════
 async function reverseResolvePhone(socket, jid) {
   const rawJid = jid.replace(/@.*$/, "");
@@ -398,22 +464,18 @@ async function reverseResolvePhone(socket, jid) {
   return rawJid;
 }
 
-// ─── CORRIGIDO: tenta Supabase e socket a cada tentativa ──
 async function resolveWithRetry(socket, jid, attempts = 5) {
   const rawJid = jid.replace(/@.*$/, "");
 
   for (let i = 0; i < attempts; i++) {
-    // 1. Tenta cache local
     const cached = phoneFromMap(rawJid);
     if (cached) { stats.lid_resolved++; return cached; }
 
     console.log("[retry] LID " + rawJid + " tentativa " + (i + 1) + "/" + attempts);
 
-    // 2. Tenta Supabase a cada tentativa (não só no final)
     const supabasePhone = await resolveFromSupabase(rawJid);
     if (supabasePhone) { stats.lid_resolved++; return supabasePhone; }
 
-    // 3. Tenta reverseResolve com socket
     const socketPhone = await reverseResolvePhone(socket, jid);
     if (socketPhone) {
       cacheJidMapping(jid, socketPhone, true);
@@ -431,8 +493,6 @@ async function resolveWithRetry(socket, jid, attempts = 5) {
 // ═══════════════════════════════════════════════════════════
 //  MESSAGE PARSING
 // ═══════════════════════════════════════════════════════════
-
-// Desempacota mensagens encapsuladas (ephemeral, viewOnce, etc.)
 function unwrapMessage(msgNode) {
   if (!msgNode || typeof msgNode !== "object") return msgNode;
   const inner =
@@ -446,29 +506,9 @@ function unwrapMessage(msgNode) {
   return inner ? unwrapMessage(inner) : msgNode;
 }
 
-// ─── REGRA FUNDAMENTAL DE EXTRAÇÃO DE JID ────────────────────────────────────
-//
-//  CORRETO:
-//    grupo  → msg.key.participant         (quem falou no grupo)
-//    direto → msg.key.remoteJid           (o contato)
-//
-//  ERRADO (não fazer):
-//    contextInfo.participant como prioridade máxima — aponta para o AUTOR
-//    DA MENSAGEM CITADA num reply, não para quem está enviando agora.
-//    Usar isso faz o reply ser atribuído ao contato errado.
-//
-//  O v8 inverteu essa lógica e foi a causa do bug de hoje.
-// ─────────────────────────────────────────────────────────────────────────────
 function extractRealJid(msg) {
   const topicJid = msg.key.remoteJid || "";
-
-  // Grupo: participant é quem enviou; remoteJid é o grupo
-  if (topicJid.endsWith("@g.us") && msg.key.participant) {
-    return msg.key.participant;
-  }
-
-  // Chat direto (inclui replies): remoteJid é sempre o remetente.
-  // NÃO usamos contextInfo.participant aqui.
+  if (topicJid.endsWith("@g.us") && msg.key.participant) return msg.key.participant;
   return topicJid || null;
 }
 
@@ -495,15 +535,25 @@ function extractText(msg) {
 
 // ═══════════════════════════════════════════════════════════
 //  SESSION FACTORY
-//  10. Backoff exponencial POR SESSÃO na reconexão
 // ═══════════════════════════════════════════════════════════
-const reconnectRetries = {};   // sessionId → contagem de retries
+const reconnectRetries = {};
 
 function getReconnectDelay(sessionId) {
   const retries = reconnectRetries[sessionId] || 0;
   reconnectRetries[sessionId] = retries + 1;
-  // Backoff: 3s, 6s, 12s, 24s, 30s (cap)
   return Math.min(30000, 3000 * Math.pow(2, retries));
+}
+
+// FIX 1: limpa chaves de sessão corrompida para forçar resync
+async function clearCorruptedSession(sessionId) {
+  const sessionDir = path.join(AUTH_DIR, sessionId);
+  const keysDir    = path.join(sessionDir, "keys");
+  try {
+    if (fs.existsSync(keysDir)) {
+      fs.rmSync(keysDir, { recursive: true, force: true });
+      console.warn("[session-resync] Chaves removidas para " + sessionId + " — próxima reconexão fará resync");
+    }
+  } catch (e) { console.error("[session-resync] Erro ao limpar chaves:", e.message); }
 }
 
 async function createSession(sessionId) {
@@ -533,19 +583,42 @@ async function createSession(sessionId) {
       session.qr = qr; session.connected = false;
       await sendWebhook({ event: "qr", session_id: sessionId, qr });
     }
+
     if (connection === "open") {
       session.qr = null; session.connected = true;
       session.phone = socket.user?.id?.split(":")[0] || null;
-      reconnectRetries[sessionId] = 0;   // reset backoff ao conectar com sucesso
+      reconnectRetries[sessionId] = 0;
+      decryptFailures[sessionId]  = 0;  // FIX 4: reset ao conectar
       console.log("[connected] " + sessionId + " (" + session.phone + ")");
       await sendWebhook({ event: "connected", session_id: sessionId, connected: true, phone_number: session.phone });
       await syncCacheFromSupabase();
+      // FIX 2: retenta mensagens perdidas ao reconectar
+      setTimeout(() => retryUnresolvedQueue(socket, sessionId), 3000);
     }
+
     if (connection === "close") {
       session.connected = false;
       const code            = lastDisconnect?.error?.output?.statusCode || 0;
+      const errorMessage    = lastDisconnect?.error?.message || "";
       const shouldReconnect = code !== DisconnectReason.loggedOut;
-      await sendWebhook({ event: "disconnected", session_id: sessionId, connected: false, reason: shouldReconnect ? "connection_lost" : "logged_out" });
+
+      // FIX 3: alerta de desconexão com detalhes do erro
+      await sendWebhook({
+        event:         "disconnected",
+        session_id:    sessionId,
+        connected:     false,
+        reason:        shouldReconnect ? "connection_lost" : "logged_out",
+        error_code:    code,
+        error_message: errorMessage,
+      });
+
+      // FIX 1: se teve decrypt failures antes de cair, limpa chaves corrompidas
+      if (shouldReconnect && (decryptFailures[sessionId] || 0) >= 3) {
+        console.warn("[session-resync] " + decryptFailures[sessionId] + " decrypt failures — limpando chaves de " + sessionId);
+        await clearCorruptedSession(sessionId);
+        decryptFailures[sessionId] = 0;
+      }
+
       if (shouldReconnect) {
         delete sessions[sessionId];
         const delay = getReconnectDelay(sessionId);
@@ -554,10 +627,24 @@ async function createSession(sessionId) {
       } else {
         delete sessions[sessionId];
         reconnectRetries[sessionId] = 0;
-        try { fs.rmSync(sessionDir, { recursive: true, force: true }); } catch (_) {}
+        try { fs.rmSync(path.join(AUTH_DIR, sessionId), { recursive: true, force: true }); } catch (_) {}
       }
     }
   });
+
+  // FIX 3: captura erros de stream e alerta via webhook
+  if (socket.ws) {
+    socket.ws.on("error", async (err) => {
+      stats.stream_errors++;
+      console.error("[stream-error] " + sessionId + ":", err?.message || err);
+      await sendWebhook({
+        event:         "stream_error",
+        session_id:    sessionId,
+        error_message: err?.message || String(err),
+        ts:            Date.now(),
+      });
+    });
+  }
 
   socket.ev.on("creds.update", saveCreds);
 
@@ -566,6 +653,23 @@ async function createSession(sessionId) {
     if (type !== "notify") return;
     for (const msg of messages) {
       if (msg.key.fromMe || !msg.message) continue;
+
+      // FIX 4: detecta decrypt failure pelo messageStubType
+      if (msg.messageStubType && !extractText(msg)) {
+        decryptFailures[sessionId] = (decryptFailures[sessionId] || 0) + 1;
+        stats.decrypt_failures++;
+        console.warn("[decrypt-fail] " + sessionId + " — stub: " + msg.messageStubType + " total: " + decryptFailures[sessionId]);
+        if (decryptFailures[sessionId] >= 3) {
+          await sendWebhook({
+            event:      "decrypt_failure_alert",
+            session_id: sessionId,
+            count:      decryptFailures[sessionId],
+            message:    "Múltiplas falhas de descriptografia — sessão pode precisar de resync",
+          });
+        }
+        continue;
+      }
+
       if (isDuplicate(msg)) { console.log("[dedup] Dropped: " + msg.key.id); continue; }
 
       const topicJid = msg.key.remoteJid || "";
@@ -573,7 +677,6 @@ async function createSession(sessionId) {
 
       stats.messages_received++;
 
-      // EXTRAÇÃO CORRETA: nunca usa contextInfo.participant como remetente
       const remoteJid = extractRealJid(msg) || topicJid;
       let phone = await reverseResolvePhone(socket, remoteJid);
 
@@ -588,12 +691,14 @@ async function createSession(sessionId) {
         }
       }
 
-      // Auto-cache: se remoteJid original era @lid e agora temos o phone
+      // FIX 4: reset contador ao receber mensagem válida
+      decryptFailures[sessionId] = 0;
+
       const origRemoteJid = msg.key.remoteJid || "";
       if (origRemoteJid.endsWith("@lid")) {
         const cleanPhone = phone.replace(/\D/g, "");
         cacheJidMapping(origRemoteJid, cleanPhone, true);
-        await upsertSupabaseMapping(origRemoteJid, cleanPhone, "lid"); // ← persiste no Supabase
+        await upsertSupabaseMapping(origRemoteJid, cleanPhone, "lid");
       }
 
       const text = extractText(msg);
@@ -611,10 +716,10 @@ async function createSession(sessionId) {
       if (!/^\d+$/.test(phone)) continue;
 
       cacheJidMapping(contact.id, phone, true);
-      await upsertSupabaseMapping(contact.id, phone, "phone"); // ← persiste no Supabase
+      await upsertSupabaseMapping(contact.id, phone, "phone");
 
       const { migrated, previousJid } = cacheJidMapping(lidFull, phone, true);
-      await upsertSupabaseMapping(lidFull, phone, "lid"); // ← persiste no Supabase
+      await upsertSupabaseMapping(lidFull, phone, "lid");
 
       if (migrated) {
         console.log("[contacts.upsert] MIGRAÇÃO: " + phone + " " + previousJid + " → " + lidFull);
@@ -626,7 +731,6 @@ async function createSession(sessionId) {
   return session;
 }
 
-// 9. message_id no payload para idempotência no backend
 async function dispatchMessage(sessionId, phone, remoteJid, text, msg) {
   const rawJid     = remoteJid.replace(/@.*$/, "");
   const jidType    = remoteJid.endsWith("@lid") ? "lid" : "phone";
@@ -640,7 +744,7 @@ async function dispatchMessage(sessionId, phone, remoteJid, text, msg) {
     real_phone: cleanPhone,
     message:    text,
     from:       cleanPhone,
-    message_id: msg.key.id,          // 9. idempotência: backend ignora duplicados pelo ID
+    message_id: msg.key.id,
     raw_jid:    rawJid,
     jid_type:   jidType,
     key: {
@@ -657,16 +761,15 @@ function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
 //  ROUTES
 // ═══════════════════════════════════════════════════════════
 
-app.get("/", (_, res) => res.json({ status: "ok", version: "v9", sessions: Object.keys(sessions).length, cache_size: Object.keys(jidToPhoneMap).length }));
+app.get("/", (_, res) => res.json({ status: "ok", version: "v10", sessions: Object.keys(sessions).length, cache_size: Object.keys(jidToPhoneMap).length }));
 
-// 13. /health com HTTP 503 quando sem sessão conectada (Railway healthcheck)
 app.get("/health", (_, res) => {
   const connected = Object.values(sessions).filter((s) => s.connected);
   const ok        = connected.length > 0;
   res.status(ok ? 200 : 503).json({
-    status:            ok ? "healthy" : "degraded",
-    connected_sessions:connected.length,
-    total_sessions:    Object.keys(sessions).length,
+    status:             ok ? "healthy" : "degraded",
+    connected_sessions: connected.length,
+    total_sessions:     Object.keys(sessions).length,
   });
 });
 
@@ -675,6 +778,7 @@ app.get("/stats", (_, res) => res.json({
   uptime_s:          Math.floor(process.uptime()),
   cache_size:        Object.keys(jidToPhoneMap).length,
   dedup_active_ids:  Object.keys(processedMsgIds).length,
+  decrypt_failures:  { ...decryptFailures },
   send_queues:       Object.fromEntries(Object.entries(sendQueues).map(([sid, q]) => [sid, q.length])),
   reconnect_retries: { ...reconnectRetries },
 }));
@@ -706,7 +810,6 @@ app.delete("/session/:id", async (req, res) => {
   res.json({ success: true });
 });
 
-// 11. Validação + rate limit por sessão
 app.post("/send", async (req, res) => {
   try {
     const { session_id, phone, message } = req.body;
@@ -728,7 +831,7 @@ app.post("/send", async (req, res) => {
       if (result?.key?.remoteJid) {
         const jidType = result.key.remoteJid.endsWith("@lid") ? "lid" : "phone";
         const { migrated, previousJid } = cacheJidMapping(result.key.remoteJid, cleanPhone, true);
-        await upsertSupabaseMapping(result.key.remoteJid, cleanPhone, jidType); // ← persiste no Supabase
+        await upsertSupabaseMapping(result.key.remoteJid, cleanPhone, jidType);
         if (migrated) {
           await sendWebhook({ event: "jid_migrated", session_id: sid, phone: cleanPhone, previous_jid: previousJid, current_jid: result.key.remoteJid, migrated_at: new Date().toISOString() });
         }
@@ -764,7 +867,7 @@ app.post("/send-file", async (req, res) => {
       if (result?.key?.remoteJid) {
         const jidType = result.key.remoteJid.endsWith("@lid") ? "lid" : "phone";
         cacheJidMapping(result.key.remoteJid, cleanPhone, true);
-        await upsertSupabaseMapping(result.key.remoteJid, cleanPhone, jidType); // ← persiste no Supabase
+        await upsertSupabaseMapping(result.key.remoteJid, cleanPhone, jidType);
       }
     });
   } catch (err) { res.status(500).json({ error: err.message }); }
@@ -775,13 +878,35 @@ app.post("/cache-jid", async (req, res) => {
   if (!jid || !phone) return res.status(400).json({ error: "jid and phone required" });
   const { migrated, previousJid } = cacheJidMapping(jid, phone, true);
   const jidType = jid.endsWith("@lid") ? "lid" : "phone";
-  await upsertSupabaseMapping(jid, phone, jidType); // ← persiste no Supabase
+  await upsertSupabaseMapping(jid, phone, jidType);
   res.json({ success: true, jid, phone, migrated, previousJid });
 });
 
 app.get("/migrations/:phone", (req, res) => {
   const cleanPhone = req.params.phone.replace(/\D/g, "");
   res.json({ phone: cleanPhone, migration: jidMigrationLog[cleanPhone] || null });
+});
+
+// FIX 2: rota manual para forçar retry da fila
+app.post("/retry-queue", async (req, res) => {
+  const sid     = req.body.session_id || Object.keys(sessions)[0];
+  const session = sessions[sid];
+  if (!session?.connected) return res.status(400).json({ error: "Sessão não conectada" });
+  retryUnresolvedQueue(session.socket, sid);
+  res.json({ success: true, message: "Retry iniciado em background" });
+});
+
+// FIX 1: rota manual para forçar resync de chaves de uma sessão
+app.post("/resync-session/:id", async (req, res) => {
+  const sessionId = req.params.id;
+  await clearCorruptedSession(sessionId);
+  const session = sessions[sessionId];
+  if (session?.socket) {
+    try { session.socket.end(); } catch (_) {}
+    delete sessions[sessionId];
+  }
+  setTimeout(() => createSession(sessionId).catch(console.error), 1000);
+  res.json({ success: true, message: "Resync iniciado para " + sessionId });
 });
 
 // ── Graceful shutdown ─────────────────────────────────────
@@ -796,7 +921,7 @@ process.on("SIGINT",  () => shutdown("SIGINT"));
 
 // ── Start ─────────────────────────────────────────────────
 app.listen(PORT, () => {
-  console.log("Gorilla Spam v9 — port " + PORT);
+  console.log("Gorilla Spam v10 — port " + PORT);
   console.log("Webhook:   " + (WEBHOOK_URL    || "NOT SET"));
   console.log("Supabase:  " + (SUPABASE_URL   ? "SET" : "NOT SET"));
   console.log("Cache:     " + CACHE_FILE);

@@ -1,19 +1,14 @@
 // ============================================================
-// GORILLA SPAM - Baileys Server (v10 - 4 FIXES)
+// GORILLA SPAM - Baileys Server (v11 - LID Receipt Capture)
 //
 // FIX 1: Resync de chaves após stream errored out
-//        — ao reconectar, força limpeza de sessão corrompida
-//        — mensagens decrypt-fail são logadas com aviso claro
-//
 // FIX 2: Retry de mensagens _unresolved do queue.log
-//        — ao conectar, relê queue.log e retenta mensagens perdidas
-//        — após retentar com sucesso, remove do arquivo
-//
 // FIX 3: Alerta de stream errored out via webhook
-//        — envia evento "stream_error" ao webhook para notificação
-//
 // FIX 4: Contador de decrypt failures com alerta automático
-//        — após 3 falhas consecutivas, força resync de sessão
+// FIX 5: Captura LID↔Phone nos receipts (messages.update)
+//        — quando o servidor envia msg para @s.whatsapp.net,
+//          o WhatsApp retorna receipt com o LID do destinatário
+//        — mapeamento 100% seguro, sem correlação temporal
 // ============================================================
 
 const express = require("express");
@@ -55,20 +50,38 @@ const stats = {
   lid_unresolved:       0,
   lid_resolved:         0,
   lid_migrations:       0,
+  lid_from_receipts:    0,   // FIX 5
   dedup_dropped:        0,
   webhook_ok:           0,
   webhook_fail:         0,
   queue_flushed:        0,
   supabase_synced:      0,
   supabase_resolved:    0,
-  decrypt_failures:     0,   // FIX 4
-  stream_errors:        0,   // FIX 3
-  unresolved_retried:   0,   // FIX 2
+  decrypt_failures:     0,
+  stream_errors:        0,
+  unresolved_retried:   0,
   started_at:           new Date().toISOString(),
 };
 
-// FIX 4: contador de decrypt failures consecutivos por sessão
-const decryptFailures = {};  // sessionId → count
+const decryptFailures = {};
+
+// FIX 5: rastreia mensagens enviadas para correlação segura nos receipts
+// Mapeia messageId → { phone, jid, sessionId, ts }
+const sentMessageTracker = {};
+const SENT_TRACKER_TTL   = 10 * 60 * 1000; // 10 minutos
+
+function trackSentMessage(messageId, phone, jid, sessionId) {
+  if (!messageId) return;
+  sentMessageTracker[messageId] = { phone, jid, sessionId, ts: Date.now() };
+}
+
+// Limpeza periódica do tracker
+setInterval(() => {
+  const now = Date.now();
+  for (const [id, entry] of Object.entries(sentMessageTracker)) {
+    if (now - entry.ts > SENT_TRACKER_TTL) delete sentMessageTracker[id];
+  }
+}, 60 * 1000);
 
 // ═══════════════════════════════════════════════════════════
 //  CACHE JID — com TTL seletivo
@@ -281,9 +294,8 @@ async function retryUnresolvedQueue(socket, sessionId) {
         _retried:     true,
         _original_ts: entry.ts,
       });
-      // não adiciona em kept — foi resolvido, sai da fila
     } else {
-      kept.push(line); // ainda não resolvido, mantém
+      kept.push(line);
     }
   }
 
@@ -411,7 +423,6 @@ async function resolveJid(socket, phone) {
         cacheJidMapping(jid, cleanPhone, false);
         await upsertSupabaseMapping(jid, cleanPhone, "phone");
 
-        // Captura LID retornado pelo onWhatsApp
         const lid = result[0].lid;
         if (lid) {
           const lidFull = lid.endsWith("@lid") ? lid : lid + "@lid";
@@ -544,7 +555,6 @@ function getReconnectDelay(sessionId) {
   return Math.min(30000, 3000 * Math.pow(2, retries));
 }
 
-// FIX 1: limpa chaves de sessão corrompida para forçar resync
 async function clearCorruptedSession(sessionId) {
   const sessionDir = path.join(AUTH_DIR, sessionId);
   const keysDir    = path.join(sessionDir, "keys");
@@ -588,11 +598,10 @@ async function createSession(sessionId) {
       session.qr = null; session.connected = true;
       session.phone = socket.user?.id?.split(":")[0] || null;
       reconnectRetries[sessionId] = 0;
-      decryptFailures[sessionId]  = 0;  // FIX 4: reset ao conectar
+      decryptFailures[sessionId]  = 0;
       console.log("[connected] " + sessionId + " (" + session.phone + ")");
       await sendWebhook({ event: "connected", session_id: sessionId, connected: true, phone_number: session.phone });
       await syncCacheFromSupabase();
-      // FIX 2: retenta mensagens perdidas ao reconectar
       setTimeout(() => retryUnresolvedQueue(socket, sessionId), 3000);
     }
 
@@ -602,7 +611,6 @@ async function createSession(sessionId) {
       const errorMessage    = lastDisconnect?.error?.message || "";
       const shouldReconnect = code !== DisconnectReason.loggedOut;
 
-      // FIX 3: alerta de desconexão com detalhes do erro
       await sendWebhook({
         event:         "disconnected",
         session_id:    sessionId,
@@ -612,7 +620,6 @@ async function createSession(sessionId) {
         error_message: errorMessage,
       });
 
-      // FIX 1: se teve decrypt failures antes de cair, limpa chaves corrompidas
       if (shouldReconnect && (decryptFailures[sessionId] || 0) >= 3) {
         console.warn("[session-resync] " + decryptFailures[sessionId] + " decrypt failures — limpando chaves de " + sessionId);
         await clearCorruptedSession(sessionId);
@@ -632,7 +639,6 @@ async function createSession(sessionId) {
     }
   });
 
-  // FIX 3: captura erros de stream e alerta via webhook
   if (socket.ws) {
     socket.ws.on("error", async (err) => {
       stats.stream_errors++;
@@ -648,13 +654,53 @@ async function createSession(sessionId) {
 
   socket.ev.on("creds.update", saveCreds);
 
+  // ─────────────────────────────────────────────────────────
+  // FIX 5: Captura LID nos receipts (messages.update)
+  // Quando enviamos uma mensagem para phone@s.whatsapp.net,
+  // o WhatsApp responde com um update contendo o remoteJid
+  // como LID@lid. Cruzamos com o sentMessageTracker para
+  // obter o mapeamento LID↔Phone de forma 100% segura.
+  // ─────────────────────────────────────────────────────────
+  socket.ev.on("messages.update", async (updates) => {
+    for (const update of updates) {
+      if (!update.key) continue;
+
+      const messageId = update.key.id;
+      const remoteJid = update.key.remoteJid || "";
+
+      // Só nos interessa receipts de mensagens que NÓS enviamos (fromMe)
+      if (!update.key.fromMe) continue;
+
+      // Se o remoteJid é um LID, temos oportunidade de mapear
+      if (remoteJid.endsWith("@lid")) {
+        const rawLid = remoteJid.replace(/@.*$/, "");
+
+        // Já temos esse LID mapeado? Skip.
+        if (phoneFromMap(rawLid)) continue;
+
+        // Busca no tracker de mensagens enviadas
+        const tracked = sentMessageTracker[messageId];
+        if (tracked && tracked.phone) {
+          const cleanPhone = tracked.phone.replace(/\D/g, "");
+          console.log("[receipt-lid] " + rawLid + " → " + cleanPhone + " (via message " + messageId + ")");
+
+          cacheJidMapping(remoteJid, cleanPhone, true);
+          await upsertSupabaseMapping(remoteJid, cleanPhone, "lid");
+          stats.lid_from_receipts++;
+
+          // Tenta resolver mensagens pendentes na fila agora que temos o mapeamento
+          setTimeout(() => retryUnresolvedQueue(socket, sessionId), 1000);
+        }
+      }
+    }
+  });
+
   socket.ev.on("messages.upsert", async ({ type, messages }) => {
     console.log("[DEBUG] upsert type:", type, "msgs:", messages.length);
     if (type !== "notify") return;
     for (const msg of messages) {
       if (msg.key.fromMe || !msg.message) continue;
 
-      // FIX 4: detecta decrypt failure pelo messageStubType
       if (msg.messageStubType && !extractText(msg)) {
         decryptFailures[sessionId] = (decryptFailures[sessionId] || 0) + 1;
         stats.decrypt_failures++;
@@ -691,7 +737,6 @@ async function createSession(sessionId) {
         }
       }
 
-      // FIX 4: reset contador ao receber mensagem válida
       decryptFailures[sessionId] = 0;
 
       const origRemoteJid = msg.key.remoteJid || "";
@@ -761,7 +806,7 @@ function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
 //  ROUTES
 // ═══════════════════════════════════════════════════════════
 
-app.get("/", (_, res) => res.json({ status: "ok", version: "v10", sessions: Object.keys(sessions).length, cache_size: Object.keys(jidToPhoneMap).length }));
+app.get("/", (_, res) => res.json({ status: "ok", version: "v11", sessions: Object.keys(sessions).length, cache_size: Object.keys(jidToPhoneMap).length }));
 
 app.get("/health", (_, res) => {
   const connected = Object.values(sessions).filter((s) => s.connected);
@@ -775,12 +820,13 @@ app.get("/health", (_, res) => {
 
 app.get("/stats", (_, res) => res.json({
   ...stats,
-  uptime_s:          Math.floor(process.uptime()),
-  cache_size:        Object.keys(jidToPhoneMap).length,
-  dedup_active_ids:  Object.keys(processedMsgIds).length,
-  decrypt_failures:  { ...decryptFailures },
-  send_queues:       Object.fromEntries(Object.entries(sendQueues).map(([sid, q]) => [sid, q.length])),
-  reconnect_retries: { ...reconnectRetries },
+  uptime_s:            Math.floor(process.uptime()),
+  cache_size:          Object.keys(jidToPhoneMap).length,
+  dedup_active_ids:    Object.keys(processedMsgIds).length,
+  sent_tracker_size:   Object.keys(sentMessageTracker).length,
+  decrypt_failures:    { ...decryptFailures },
+  send_queues:         Object.fromEntries(Object.entries(sendQueues).map(([sid, q]) => [sid, q.length])),
+  reconnect_retries:   { ...reconnectRetries },
 }));
 
 app.get("/cache", (_, res) => res.json({ jid_to_phone: jidToPhoneMap, phone_to_jid: phoneToJidMap, migrations: jidMigrationLog }));
@@ -828,12 +874,17 @@ app.post("/send", async (req, res) => {
 
     enqueueSend(sid, async () => {
       const result = await session.socket.sendMessage(jid, { text: message });
-      if (result?.key?.remoteJid) {
-        const jidType = result.key.remoteJid.endsWith("@lid") ? "lid" : "phone";
-        const { migrated, previousJid } = cacheJidMapping(result.key.remoteJid, cleanPhone, true);
-        await upsertSupabaseMapping(result.key.remoteJid, cleanPhone, jidType);
-        if (migrated) {
-          await sendWebhook({ event: "jid_migrated", session_id: sid, phone: cleanPhone, previous_jid: previousJid, current_jid: result.key.remoteJid, migrated_at: new Date().toISOString() });
+      if (result?.key) {
+        // FIX 5: rastreia a mensagem enviada para capturar LID no receipt
+        trackSentMessage(result.key.id, cleanPhone, jid, sid);
+
+        if (result.key.remoteJid) {
+          const jidType = result.key.remoteJid.endsWith("@lid") ? "lid" : "phone";
+          const { migrated, previousJid } = cacheJidMapping(result.key.remoteJid, cleanPhone, true);
+          await upsertSupabaseMapping(result.key.remoteJid, cleanPhone, jidType);
+          if (migrated) {
+            await sendWebhook({ event: "jid_migrated", session_id: sid, phone: cleanPhone, previous_jid: previousJid, current_jid: result.key.remoteJid, migrated_at: new Date().toISOString() });
+          }
         }
       }
     });
@@ -864,10 +915,15 @@ app.post("/send-file", async (req, res) => {
     res.json({ success: true, session_id: sid, phone: cleanPhone, file_name, jid, queued: true });
     enqueueSend(sid, async () => {
       const result = await session.socket.sendMessage(jid, msgContent);
-      if (result?.key?.remoteJid) {
-        const jidType = result.key.remoteJid.endsWith("@lid") ? "lid" : "phone";
-        cacheJidMapping(result.key.remoteJid, cleanPhone, true);
-        await upsertSupabaseMapping(result.key.remoteJid, cleanPhone, jidType);
+      if (result?.key) {
+        // FIX 5: rastreia para captura de LID no receipt
+        trackSentMessage(result.key.id, cleanPhone, jid, sid);
+
+        if (result.key.remoteJid) {
+          const jidType = result.key.remoteJid.endsWith("@lid") ? "lid" : "phone";
+          cacheJidMapping(result.key.remoteJid, cleanPhone, true);
+          await upsertSupabaseMapping(result.key.remoteJid, cleanPhone, jidType);
+        }
       }
     });
   } catch (err) { res.status(500).json({ error: err.message }); }
@@ -887,7 +943,6 @@ app.get("/migrations/:phone", (req, res) => {
   res.json({ phone: cleanPhone, migration: jidMigrationLog[cleanPhone] || null });
 });
 
-// FIX 2: rota manual para forçar retry da fila
 app.post("/retry-queue", async (req, res) => {
   const sid     = req.body.session_id || Object.keys(sessions)[0];
   const session = sessions[sid];
@@ -896,7 +951,6 @@ app.post("/retry-queue", async (req, res) => {
   res.json({ success: true, message: "Retry iniciado em background" });
 });
 
-// FIX 1: rota manual para forçar resync de chaves de uma sessão
 app.post("/resync-session/:id", async (req, res) => {
   const sessionId = req.params.id;
   await clearCorruptedSession(sessionId);
@@ -921,7 +975,7 @@ process.on("SIGINT",  () => shutdown("SIGINT"));
 
 // ── Start ─────────────────────────────────────────────────
 app.listen(PORT, () => {
-  console.log("Gorilla Spam v10 — port " + PORT);
+  console.log("Gorilla Spam v11 — port " + PORT);
   console.log("Webhook:   " + (WEBHOOK_URL    || "NOT SET"));
   console.log("Supabase:  " + (SUPABASE_URL   ? "SET" : "NOT SET"));
   console.log("Cache:     " + CACHE_FILE);

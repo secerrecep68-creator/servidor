@@ -963,6 +963,34 @@ app.post("/resync-session/:id", async (req, res) => {
   res.json({ success: true, message: "Resync iniciado para " + sessionId });
 });
 
+app.post('/onWhatsApp', async (req, res) => {
+  try {
+    const { session_id, phone } = req.body;
+    if (!phone) {
+      return res.status(400).json({ error: 'phone is required' });
+    }
+
+    const session = sessions.get(session_id);
+    if (!session || !session.sock) {
+      return res.status(404).json({ error: `Session ${session_id} not found or not connected` });
+    }
+
+    const cleanPhone = phone.replace(/[^0-9]/g, '');
+    const jid = cleanPhone.includes('@') ? cleanPhone : `${cleanPhone}@s.whatsapp.net`;
+
+    const [result] = await session.sock.onWhatsApp(jid);
+
+    if (result && result.exists) {
+      return res.json({ exists: true, jid: result.jid, phone: cleanPhone });
+    } else {
+      return res.json({ exists: false, jid: null, phone: cleanPhone, error: 'Number not on WhatsApp' });
+    }
+  } catch (err) {
+    console.error('[onWhatsApp] Error:', err.message);
+    return res.status(500).json({ error: err.message });
+  }
+});
+
 // ── Graceful shutdown ─────────────────────────────────────
 async function shutdown(signal) {
   console.log("[shutdown] " + signal);

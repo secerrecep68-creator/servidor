@@ -910,7 +910,7 @@ app.post("/send-file", async (req, res) => {
     let msgContent;
     if (["jpg","jpeg","png","gif","webp"].includes(ext))  msgContent = { image: { url: file_url }, caption };
     else if (["mp4","mov","avi","mkv"].includes(ext))      msgContent = { video: { url: file_url }, caption };
-    else msgContent = { document: { url: file_url }, fileName: file_name, mimetype: "application/octet-stream", caption };
+    else msgContent = { document: { url: file_url }, fileName: file_name, mimetype: req.body.mimetype || "application/octet-stream", caption };
 
     res.json({ success: true, session_id: sid, phone: cleanPhone, file_name, jid, queued: true });
     enqueueSend(sid, async () => {

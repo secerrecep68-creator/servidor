@@ -1003,12 +1003,13 @@ app.post('/archive', async (req, res) => {
     if (!session?.socket) {
       return res.status(400).json({ error: 'Session not connected' });
     }
+    console.log(`[archive] Attempting to ${archive ? 'archive' : 'unarchive'} chat ${jid} via session ${session_id}`);
     await session.socket.chatModify(
       {
         archive,
         lastMessages: [{
-          key: { remoteJid: jid, fromMe: false },
-          messageTimestamp: undefined
+          key: { remoteJid: jid, fromMe: false, id: '' },
+          messageTimestamp: Math.floor(Date.now() / 1000)
         }]
       },
       jid
@@ -1017,6 +1018,24 @@ app.post('/archive', async (req, res) => {
     res.json({ success: true });
   } catch (err) {
     console.error('[archive] Error:', err.message);
+
+    // Se "Incomplete key", tentar método alternativo com lastMessages vazio
+    if (err.message?.includes('Incomplete')) {
+      try {
+        const session = sessions[req.body.session_id];
+        console.log(`[archive] Incomplete key error — retrying with empty lastMessages for ${req.body.jid}`);
+        await session.socket.chatModify(
+          { archive: req.body.archive, lastMessages: [] },
+          req.body.jid
+        );
+        console.log(`[archive] Fallback succeeded for ${req.body.jid}`);
+        return res.json({ success: true, method: 'fallback' });
+      } catch (e2) {
+        console.error('[archive] Fallback also failed:', e2.message);
+        return res.status(500).json({ error: e2.message, hint: 'Baileys não tem chaves para este JID' });
+      }
+    }
+
     res.status(500).json({ error: err.message });
   }
 });

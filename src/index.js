@@ -991,14 +991,32 @@ app.post('/onWhatsApp', async (req, res) => {
   }
 });
 
+// Rota para arquivar/desarquivar chats
 app.post('/archive', async (req, res) => {
-  const { session_id, jid, archive } = req.body;
-  const session = sessions[session_id];
-  if (!session?.socket) return res.status(404).json({ error: 'Session not connected' });
   try {
-    await session.socket.chatModify({ archive, lastMessages: [{ key: { remoteJid: jid, fromMe: false }, messageTimestamp: undefined }] }, jid);
-    res.json({ success: true, jid, archived: archive });
+    const { session_id, jid, archive } = req.body;
+
+    if (!session_id || !jid) {
+      return res.status(400).json({ error: 'session_id and jid required' });
+    }
+    const session = sessions[session_id];
+    if (!session?.socket) {
+      return res.status(400).json({ error: 'Session not connected' });
+    }
+    await session.socket.chatModify(
+      {
+        archive,
+        lastMessages: [{
+          key: { remoteJid: jid, fromMe: false },
+          messageTimestamp: undefined
+        }]
+      },
+      jid
+    );
+    console.log(`[archive] Chat ${jid} ${archive ? 'archived' : 'unarchived'} via session ${session_id}`);
+    res.json({ success: true });
   } catch (err) {
+    console.error('[archive] Error:', err.message);
     res.status(500).json({ error: err.message });
   }
 });

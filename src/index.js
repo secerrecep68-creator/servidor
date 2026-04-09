@@ -991,6 +991,18 @@ app.post('/onWhatsApp', async (req, res) => {
   }
 });
 
+app.post('/archive', async (req, res) => {
+  const { session_id, jid, archive } = req.body;
+  const session = sessions[session_id];
+  if (!session?.socket) return res.status(404).json({ error: 'Session not connected' });
+  try {
+    await session.socket.chatModify({ archive, lastMessages: [{ key: { remoteJid: jid, fromMe: false }, messageTimestamp: undefined }] }, jid);
+    res.json({ success: true, jid, archived: archive });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // ── Graceful shutdown ─────────────────────────────────────
 async function shutdown(signal) {
   console.log("[shutdown] " + signal);

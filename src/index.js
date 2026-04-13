@@ -18,6 +18,7 @@ const {
   DisconnectReason,
   makeCacheableSignalKeyStore,
   fetchLatestBaileysVersion,
+  downloadMediaMessage,
 } = require("@whiskeysockets/baileys");
 const pino = require("pino");
 const fs   = require("fs");
@@ -40,6 +41,9 @@ const QUEUE_FILE      = path.join(CACHE_DIR, "queue.log");
 
 const logger   = pino({ level: "warn" });
 const sessions = {};
+
+const recentMessages = new Map(); // messageId -> message object
+const RECENT_MSG_TTL = 10 * 60 * 1000; // 10 minutos
 
 // ═══════════════════════════════════════════════════════════
 //  MÉTRICAS
@@ -751,6 +755,21 @@ async function createSession(sessionId) {
       stats.messages_dispatched++;
       await dispatchMessage(sessionId, phone, remoteJid, text, msg);
     }
+
+    // Cache recent messages for download
+    for (const msg of messages) {
+      if (msg.key?.id && msg.message) {
+        recentMessages.set(msg.key.id, { msg, timestamp: Date.now() });
+
+        // Cleanup old messages
+        if (recentMessages.size > 500) {
+          const now = Date.now();
+          for (const [id, entry] of recentMessages) {
+            if (now - entry.timestamp > RECENT_MSG_TTL) recentMessages.delete(id);
+          }
+        }
+      }
+    }
   });
 
   socket.ev.on("contacts.upsert", async (contacts) => {
@@ -1137,6 +1156,61 @@ app.post('/send-reaction', async (req, res) => {
     console.error('[send-reaction] Error:', err.message);
     // Non-critical
     res.json({ success: true, warning: err.message });
+  }
+});
+
+// ─── DOWNLOAD MEDIA ──────────────────────────────────────
+// POST /download-media
+// Body: { session_id, message_id }
+app.post('/download-media', async (req, res) => {
+  try {
+    const { session_id, message_id } = req.body;
+    if (!session_id || !message_id) {
+      return res.status(400).json({ error: 'session_id e message_id são obrigatórios' });
+    }
+    const session = sessions[session_id];
+    if (!session?.socket) {
+      return res.status(404).json({ error: 'Sessão não encontrada ou desconectada' });
+    }
+    // Buscar mensagem do cache
+    const cached = recentMessages.get(message_id);
+    if (!cached?.msg) {
+      return res.status(404).json({ error: 'Mensagem não encontrada no cache. Certifique-se de armazenar mensagens no handler messages.upsert.' });
+    }
+    const { msg } = cached;
+    // Baixar a mídia (áudio, imagem, vídeo, documento)
+    const buffer = await downloadMediaMessage(
+      msg,
+      'buffer',
+      {},
+      {
+        logger: console,
+        reuploadRequest: session.socket.updateMediaMessage,
+      }
+    );
+    if (!buffer || buffer.length === 0) {
+      return res.status(404).json({ error: 'Não foi possível baixar a mídia' });
+    }
+    // Retornar como base64
+    const base64 = buffer.toString('base64');
+
+    // Detectar o mimetype
+    const message = msg.message;
+    const audioMsg = message?.audioMessage;
+    const imageMsg = message?.imageMessage;
+    const videoMsg = message?.videoMessage;
+    const docMsg   = message?.documentMessage;
+    const mimetype = audioMsg?.mimetype || imageMsg?.mimetype || videoMsg?.mimetype || docMsg?.mimetype || 'application/octet-stream';
+    console.log(`[download-media] Downloaded ${message_id}: ${buffer.length} bytes, ${mimetype}`);
+    res.json({
+      success: true,
+      data: base64,
+      mimetype,
+      size: buffer.length,
+    });
+  } catch (err) {
+    console.error('[download-media] Error:', err.message);
+    res.status(500).json({ error: err.message });
   }
 });
 

@@ -1040,6 +1040,106 @@ app.post('/archive', async (req, res) => {
   }
 });
 
+// ─── SEND PRESENCE (typing indicator) ────────────────────
+// POST /send-presence
+// Body: { session_id, phone, type: "composing" | "paused" | "available" }
+app.post('/send-presence', async (req, res) => {
+  try {
+    const { session_id, phone, type } = req.body;
+    if (!session_id || !phone || !type) {
+      return res.status(400).json({ error: 'session_id, phone e type são obrigatórios' });
+    }
+    const session = sessions[session_id];
+    if (!session?.socket) {
+      return res.status(404).json({ error: 'Sessão não encontrada ou desconectada' });
+    }
+    // Formatar JID
+    const digits = phone.replace(/\D/g, '');
+    const jid = digits.includes('@') ? digits : `${digits}@s.whatsapp.net`;
+    // Enviar presença
+    await session.socket.presenceSubscribe(jid);
+    await session.socket.sendPresenceUpdate(type, jid);
+    res.json({ success: true, type, to: jid });
+  } catch (err) {
+    console.error('[send-presence] Error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ─── MARK AS READ (read receipts) ───────────────────────
+// POST /mark-read
+// Body: { session_id, phone }
+app.post('/mark-read', async (req, res) => {
+  try {
+    const { session_id, phone } = req.body;
+    if (!session_id || !phone) {
+      return res.status(400).json({ error: 'session_id e phone são obrigatórios' });
+    }
+    const session = sessions[session_id];
+    if (!session?.socket) {
+      return res.status(404).json({ error: 'Sessão não encontrada ou desconectada' });
+    }
+    const digits = phone.replace(/\D/g, '');
+    const jid = digits.includes('@') ? digits : `${digits}@s.whatsapp.net`;
+    // Marcar como lido - envia read receipt
+    await session.socket.readMessages([{
+      remoteJid: jid,
+      id: undefined, // marca todas as mensagens pendentes
+      participant: undefined
+    }]).catch(() => {
+      // Fallback: usar chatModify
+      return session.socket.chatModify(
+        { markRead: true, lastMessages: [{ key: { remoteJid: jid }, messageTimestamp: Math.floor(Date.now() / 1000) }] },
+        jid
+      );
+    });
+    res.json({ success: true, marked: jid });
+  } catch (err) {
+    console.error('[mark-read] Error:', err.message);
+    // Non-critical - return success even on error
+    res.json({ success: true, warning: err.message });
+  }
+});
+
+// ─── SEND REACTION (emoji reactions) ─────────────────────
+// POST /send-reaction
+// Body: { session_id, phone, emoji }
+app.post('/send-reaction', async (req, res) => {
+  try {
+    const { session_id, phone, emoji } = req.body;
+    if (!session_id || !phone || !emoji) {
+      return res.status(400).json({ error: 'session_id, phone e emoji são obrigatórios' });
+    }
+    const session = sessions[session_id];
+    if (!session?.socket) {
+      return res.status(404).json({ error: 'Sessão não encontrada ou desconectada' });
+    }
+    const digits = phone.replace(/\D/g, '');
+    const jid = digits.includes('@') ? digits : `${digits}@s.whatsapp.net`;
+    // Para reagir, precisamos do messageId da última mensagem recebida
+    // Buscar a última mensagem do chat
+    const messages = await session.socket.fetchMessagesFromWA(jid, 1).catch(() => []);
+
+    if (messages && messages.length > 0) {
+      const lastMsg = messages[0];
+      await session.socket.sendMessage(jid, {
+        react: {
+          text: emoji,
+          key: lastMsg.key
+        }
+      });
+      res.json({ success: true, emoji, to: jid });
+    } else {
+      // Fallback: se não conseguir buscar mensagens, ignora silenciosamente
+      res.json({ success: true, warning: 'no_messages_to_react' });
+    }
+  } catch (err) {
+    console.error('[send-reaction] Error:', err.message);
+    // Non-critical
+    res.json({ success: true, warning: err.message });
+  }
+});
+
 // ── Graceful shutdown ─────────────────────────────────────
 async function shutdown(signal) {
   console.log("[shutdown] " + signal);

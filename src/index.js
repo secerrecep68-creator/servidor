@@ -1,14 +1,5 @@
 // ============================================================
 // GORILLA SPAM - Baileys Server (v11 - LID Receipt Capture)
-//
-// FIX 1: Resync de chaves após stream errored out
-// FIX 2: Retry de mensagens _unresolved do queue.log
-// FIX 3: Alerta de stream errored out via webhook
-// FIX 4: Contador de decrypt failures com alerta automático
-// FIX 5: Captura LID↔Phone nos receipts (messages.update)
-//        — quando o servidor envia msg para @s.whatsapp.net,
-//          o WhatsApp retorna receipt com o LID do destinatário
-//        — mapeamento 100% seguro, sem correlação temporal
 // ============================================================
 
 const express = require("express");
@@ -988,16 +979,15 @@ app.post('/onWhatsApp', async (req, res) => {
     if (!phone) {
       return res.status(400).json({ error: 'phone is required' });
     }
-
-    const session = sessions.get(session_id);
-    if (!session || !session.sock) {
+    const session = sessions[session_id];
+    if (!session || !session.socket) {
       return res.status(404).json({ error: `Session ${session_id} not found or not connected` });
     }
 
     const cleanPhone = phone.replace(/[^0-9]/g, '');
     const jid = cleanPhone.includes('@') ? cleanPhone : `${cleanPhone}@s.whatsapp.net`;
 
-    const [result] = await session.sock.onWhatsApp(jid);
+    const [result] = await session.socket.onWhatsApp(jid);
 
     if (result && result.exists) {
       return res.json({ exists: true, jid: result.jid, phone: cleanPhone });

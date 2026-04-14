@@ -1,14 +1,14 @@
 // ============================================================
-// GORILLA SPAM - Baileys Server (v11 - LID Receipt Capture)
+// GORILLA SPAM - Baileys Server (v12 - JID Fix + Bug Fixes)
 //
 // FIX 1: Resync de chaves após stream errored out
 // FIX 2: Retry de mensagens _unresolved do queue.log
 // FIX 3: Alerta de stream errored out via webhook
 // FIX 4: Contador de decrypt failures com alerta automático
 // FIX 5: Captura LID↔Phone nos receipts (messages.update)
-//        — quando o servidor envia msg para @s.whatsapp.net,
-//          o WhatsApp retorna receipt com o LID do destinatário
-//        — mapeamento 100% seguro, sem correlação temporal
+// FIX 6: /send aceita campo jid direto (LID support)
+// FIX 7: /onWhatsApp corrigido (sessions[] + .socket)
+// FIX 8: /send-file aceita campo jid direto
 // ============================================================
 
 const express = require("express");
@@ -42,8 +42,8 @@ const QUEUE_FILE      = path.join(CACHE_DIR, "queue.log");
 const logger   = pino({ level: "warn" });
 const sessions = {};
 
-const recentMessages = new Map(); // messageId -> message object
-const RECENT_MSG_TTL = 10 * 60 * 1000; // 10 minutos
+const recentMessages = new Map();
+const RECENT_MSG_TTL = 10 * 60 * 1000;
 
 // ═══════════════════════════════════════════════════════════
 //  MÉTRICAS
@@ -54,7 +54,7 @@ const stats = {
   lid_unresolved:       0,
   lid_resolved:         0,
   lid_migrations:       0,
-  lid_from_receipts:    0,   // FIX 5
+  lid_from_receipts:    0,
   dedup_dropped:        0,
   webhook_ok:           0,
   webhook_fail:         0,
@@ -69,17 +69,14 @@ const stats = {
 
 const decryptFailures = {};
 
-// FIX 5: rastreia mensagens enviadas para correlação segura nos receipts
-// Mapeia messageId → { phone, jid, sessionId, ts }
 const sentMessageTracker = {};
-const SENT_TRACKER_TTL   = 10 * 60 * 1000; // 10 minutos
+const SENT_TRACKER_TTL   = 10 * 60 * 1000;
 
 function trackSentMessage(messageId, phone, jid, sessionId) {
   if (!messageId) return;
   sentMessageTracker[messageId] = { phone, jid, sessionId, ts: Date.now() };
 }
 
-// Limpeza periódica do tracker
 setInterval(() => {
   const now = Date.now();
   for (const [id, entry] of Object.entries(sentMessageTracker)) {
@@ -658,13 +655,7 @@ async function createSession(sessionId) {
 
   socket.ev.on("creds.update", saveCreds);
 
-  // ─────────────────────────────────────────────────────────
   // FIX 5: Captura LID nos receipts (messages.update)
-  // Quando enviamos uma mensagem para phone@s.whatsapp.net,
-  // o WhatsApp responde com um update contendo o remoteJid
-  // como LID@lid. Cruzamos com o sentMessageTracker para
-  // obter o mapeamento LID↔Phone de forma 100% segura.
-  // ─────────────────────────────────────────────────────────
   socket.ev.on("messages.update", async (updates) => {
     for (const update of updates) {
       if (!update.key) continue;
@@ -672,17 +663,13 @@ async function createSession(sessionId) {
       const messageId = update.key.id;
       const remoteJid = update.key.remoteJid || "";
 
-      // Só nos interessa receipts de mensagens que NÓS enviamos (fromMe)
       if (!update.key.fromMe) continue;
 
-      // Se o remoteJid é um LID, temos oportunidade de mapear
       if (remoteJid.endsWith("@lid")) {
         const rawLid = remoteJid.replace(/@.*$/, "");
 
-        // Já temos esse LID mapeado? Skip.
         if (phoneFromMap(rawLid)) continue;
 
-        // Busca no tracker de mensagens enviadas
         const tracked = sentMessageTracker[messageId];
         if (tracked && tracked.phone) {
           const cleanPhone = tracked.phone.replace(/\D/g, "");
@@ -692,7 +679,6 @@ async function createSession(sessionId) {
           await upsertSupabaseMapping(remoteJid, cleanPhone, "lid");
           stats.lid_from_receipts++;
 
-          // Tenta resolver mensagens pendentes na fila agora que temos o mapeamento
           setTimeout(() => retryUnresolvedQueue(socket, sessionId), 1000);
         }
       }
@@ -756,12 +742,10 @@ async function createSession(sessionId) {
       await dispatchMessage(sessionId, phone, remoteJid, text, msg);
     }
 
-    // Cache recent messages for download
     for (const msg of messages) {
       if (msg.key?.id && msg.message) {
         recentMessages.set(msg.key.id, { msg, timestamp: Date.now() });
 
-        // Cleanup old messages
         if (recentMessages.size > 500) {
           const now = Date.now();
           for (const [id, entry] of recentMessages) {
@@ -825,7 +809,7 @@ function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
 //  ROUTES
 // ═══════════════════════════════════════════════════════════
 
-app.get("/", (_, res) => res.json({ status: "ok", version: "v11", sessions: Object.keys(sessions).length, cache_size: Object.keys(jidToPhoneMap).length }));
+app.get("/", (_, res) => res.json({ status: "ok", version: "v12", sessions: Object.keys(sessions).length, cache_size: Object.keys(jidToPhoneMap).length }));
 
 app.get("/health", (_, res) => {
   const connected = Object.values(sessions).filter((s) => s.connected);
@@ -875,9 +859,14 @@ app.delete("/session/:id", async (req, res) => {
   res.json({ success: true });
 });
 
+// ═══════════════════════════════════════════════════════════
+//  FIX 6: /send aceita campo `jid` direto do payload
+//  Se a edge function envia { jid: "123@lid" }, usa direto.
+//  Senão, resolve pelo phone normalmente.
+// ═══════════════════════════════════════════════════════════
 app.post("/send", async (req, res) => {
   try {
-    const { session_id, phone, message } = req.body;
+    const { session_id, phone, message, jid: providedJid } = req.body;
     if (!phone || !message) return res.status(400).json({ error: "phone and message required" });
 
     let cleanPhone;
@@ -888,13 +877,16 @@ app.post("/send", async (req, res) => {
     const session = sessions[sid];
     if (!session?.connected) return res.status(400).json({ error: "Session " + sid + " not connected" });
 
-    const jid = await resolveJid(session.socket, cleanPhone);
+    // FIX 6: usa JID fornecido se presente, senão resolve
+    const jid = providedJid || await resolveJid(session.socket, cleanPhone);
+
+    console.log("[send] phone=" + cleanPhone + " jid=" + jid + (providedJid ? " (provided)" : " (resolved)"));
+
     res.json({ success: true, session_id: sid, phone: cleanPhone, jid, queued: true });
 
     enqueueSend(sid, async () => {
       const result = await session.socket.sendMessage(jid, { text: message });
       if (result?.key) {
-        // FIX 5: rastreia a mensagem enviada para capturar LID no receipt
         trackSentMessage(result.key.id, cleanPhone, jid, sid);
 
         if (result.key.remoteJid) {
@@ -910,9 +902,12 @@ app.post("/send", async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+// ═══════════════════════════════════════════════════════════
+//  FIX 8: /send-file aceita campo `jid` direto
+// ═══════════════════════════════════════════════════════════
 app.post("/send-file", async (req, res) => {
   try {
-    const { session_id, phone, file_url, caption = "" } = req.body;
+    const { session_id, phone, file_url, caption = "", jid: providedJid } = req.body;
     const file_name = req.body.file_name || "file";
     if (!phone || !file_url) return res.status(400).json({ error: "phone and file_url required" });
 
@@ -924,7 +919,11 @@ app.post("/send-file", async (req, res) => {
     const session = sessions[sid];
     if (!session?.connected) return res.status(400).json({ error: "Session " + sid + " not connected" });
 
-    const jid = await resolveJid(session.socket, cleanPhone);
+    // FIX 8: usa JID fornecido se presente
+    const jid = providedJid || await resolveJid(session.socket, cleanPhone);
+
+    console.log("[send-file] phone=" + cleanPhone + " jid=" + jid + (providedJid ? " (provided)" : " (resolved)"));
+
     const ext = file_name.split(".").pop().toLowerCase();
     let msgContent;
     if (["jpg","jpeg","png","gif","webp"].includes(ext))  msgContent = { image: { url: file_url }, caption };
@@ -935,7 +934,6 @@ app.post("/send-file", async (req, res) => {
     enqueueSend(sid, async () => {
       const result = await session.socket.sendMessage(jid, msgContent);
       if (result?.key) {
-        // FIX 5: rastreia para captura de LID no receipt
         trackSentMessage(result.key.id, cleanPhone, jid, sid);
 
         if (result.key.remoteJid) {
@@ -982,6 +980,9 @@ app.post("/resync-session/:id", async (req, res) => {
   res.json({ success: true, message: "Resync iniciado para " + sessionId });
 });
 
+// ═══════════════════════════════════════════════════════════
+//  FIX 7: /onWhatsApp corrigido — sessions[] + .socket
+// ═══════════════════════════════════════════════════════════
 app.post('/onWhatsApp', async (req, res) => {
   try {
     const { session_id, phone } = req.body;
@@ -989,15 +990,18 @@ app.post('/onWhatsApp', async (req, res) => {
       return res.status(400).json({ error: 'phone is required' });
     }
 
-    const session = sessions.get(session_id);
-    if (!session || !session.sock) {
+    // FIX 7: era sessions.get() — corrigido para sessions[]
+    const session = sessions[session_id];
+    // FIX 7: era session.sock — corrigido para session.socket
+    if (!session || !session.socket) {
       return res.status(404).json({ error: `Session ${session_id} not found or not connected` });
     }
 
     const cleanPhone = phone.replace(/[^0-9]/g, '');
     const jid = cleanPhone.includes('@') ? cleanPhone : `${cleanPhone}@s.whatsapp.net`;
 
-    const [result] = await session.sock.onWhatsApp(jid);
+    // FIX 7: era session.sock — corrigido para session.socket
+    const [result] = await session.socket.onWhatsApp(jid);
 
     if (result && result.exists) {
       return res.json({ exists: true, jid: result.jid, phone: cleanPhone });
@@ -1010,7 +1014,6 @@ app.post('/onWhatsApp', async (req, res) => {
   }
 });
 
-// Rota para arquivar/desarquivar chats
 app.post('/archive', async (req, res) => {
   try {
     const { session_id, jid, archive } = req.body;
@@ -1038,7 +1041,6 @@ app.post('/archive', async (req, res) => {
   } catch (err) {
     console.error('[archive] Error:', err.message);
 
-    // Se "Incomplete key", tentar método alternativo com lastMessages vazio
     if (err.message?.includes('Incomplete')) {
       try {
         const session = sessions[req.body.session_id];
@@ -1060,11 +1062,9 @@ app.post('/archive', async (req, res) => {
 });
 
 // ─── SEND PRESENCE (typing indicator) ────────────────────
-// POST /send-presence
-// Body: { session_id, phone, type: "composing" | "paused" | "available" }
 app.post('/send-presence', async (req, res) => {
   try {
-    const { session_id, phone, type } = req.body;
+    const { session_id, phone, type, jid: providedJid } = req.body;
     if (!session_id || !phone || !type) {
       return res.status(400).json({ error: 'session_id, phone e type são obrigatórios' });
     }
@@ -1072,10 +1072,10 @@ app.post('/send-presence', async (req, res) => {
     if (!session?.socket) {
       return res.status(404).json({ error: 'Sessão não encontrada ou desconectada' });
     }
-    // Formatar JID
+    // Usa JID fornecido ou monta do phone
     const digits = phone.replace(/\D/g, '');
-    const jid = digits.includes('@') ? digits : `${digits}@s.whatsapp.net`;
-    // Enviar presença
+    const jid = providedJid || phoneToJidMap[digits] || `${digits}@s.whatsapp.net`;
+
     await session.socket.presenceSubscribe(jid);
     await session.socket.sendPresenceUpdate(type, jid);
     res.json({ success: true, type, to: jid });
@@ -1086,11 +1086,9 @@ app.post('/send-presence', async (req, res) => {
 });
 
 // ─── MARK AS READ (read receipts) ───────────────────────
-// POST /mark-read
-// Body: { session_id, phone }
 app.post('/mark-read', async (req, res) => {
   try {
-    const { session_id, phone } = req.body;
+    const { session_id, phone, jid: providedJid } = req.body;
     if (!session_id || !phone) {
       return res.status(400).json({ error: 'session_id e phone são obrigatórios' });
     }
@@ -1099,14 +1097,13 @@ app.post('/mark-read', async (req, res) => {
       return res.status(404).json({ error: 'Sessão não encontrada ou desconectada' });
     }
     const digits = phone.replace(/\D/g, '');
-    const jid = digits.includes('@') ? digits : `${digits}@s.whatsapp.net`;
-    // Marcar como lido - envia read receipt
+    const jid = providedJid || phoneToJidMap[digits] || `${digits}@s.whatsapp.net`;
+
     await session.socket.readMessages([{
       remoteJid: jid,
-      id: undefined, // marca todas as mensagens pendentes
+      id: undefined,
       participant: undefined
     }]).catch(() => {
-      // Fallback: usar chatModify
       return session.socket.chatModify(
         { markRead: true, lastMessages: [{ key: { remoteJid: jid }, messageTimestamp: Math.floor(Date.now() / 1000) }] },
         jid
@@ -1115,14 +1112,11 @@ app.post('/mark-read', async (req, res) => {
     res.json({ success: true, marked: jid });
   } catch (err) {
     console.error('[mark-read] Error:', err.message);
-    // Non-critical - return success even on error
     res.json({ success: true, warning: err.message });
   }
 });
 
 // ─── SEND REACTION (emoji reactions) ─────────────────────
-// POST /send-reaction
-// Body: { session_id, phone, emoji }
 app.post('/send-reaction', async (req, res) => {
   try {
     const { session_id, phone, emoji } = req.body;
@@ -1135,8 +1129,7 @@ app.post('/send-reaction', async (req, res) => {
     }
     const digits = phone.replace(/\D/g, '');
     const jid = digits.includes('@') ? digits : `${digits}@s.whatsapp.net`;
-    // Para reagir, precisamos do messageId da última mensagem recebida
-    // Buscar a última mensagem do chat
+
     const messages = await session.socket.fetchMessagesFromWA(jid, 1).catch(() => []);
 
     if (messages && messages.length > 0) {
@@ -1149,19 +1142,15 @@ app.post('/send-reaction', async (req, res) => {
       });
       res.json({ success: true, emoji, to: jid });
     } else {
-      // Fallback: se não conseguir buscar mensagens, ignora silenciosamente
       res.json({ success: true, warning: 'no_messages_to_react' });
     }
   } catch (err) {
     console.error('[send-reaction] Error:', err.message);
-    // Non-critical
     res.json({ success: true, warning: err.message });
   }
 });
 
 // ─── DOWNLOAD MEDIA ──────────────────────────────────────
-// POST /download-media
-// Body: { session_id, message_id }
 app.post('/download-media', async (req, res) => {
   try {
     const { session_id, message_id } = req.body;
@@ -1172,13 +1161,11 @@ app.post('/download-media', async (req, res) => {
     if (!session?.socket) {
       return res.status(404).json({ error: 'Sessão não encontrada ou desconectada' });
     }
-    // Buscar mensagem do cache
     const cached = recentMessages.get(message_id);
     if (!cached?.msg) {
-      return res.status(404).json({ error: 'Mensagem não encontrada no cache. Certifique-se de armazenar mensagens no handler messages.upsert.' });
+      return res.status(404).json({ error: 'Mensagem não encontrada no cache.' });
     }
     const { msg } = cached;
-    // Baixar a mídia (áudio, imagem, vídeo, documento)
     const buffer = await downloadMediaMessage(
       msg,
       'buffer',
@@ -1191,10 +1178,8 @@ app.post('/download-media', async (req, res) => {
     if (!buffer || buffer.length === 0) {
       return res.status(404).json({ error: 'Não foi possível baixar a mídia' });
     }
-    // Retornar como base64
     const base64 = buffer.toString('base64');
 
-    // Detectar o mimetype
     const message = msg.message;
     const audioMsg = message?.audioMessage;
     const imageMsg = message?.imageMessage;
@@ -1226,7 +1211,7 @@ process.on("SIGINT",  () => shutdown("SIGINT"));
 
 // ── Start ─────────────────────────────────────────────────
 app.listen(PORT, () => {
-  console.log("Gorilla Spam v11 — port " + PORT);
+  console.log("Gorilla Spam v12 — port " + PORT);
   console.log("Webhook:   " + (WEBHOOK_URL    || "NOT SET"));
   console.log("Supabase:  " + (SUPABASE_URL   ? "SET" : "NOT SET"));
   console.log("Cache:     " + CACHE_FILE);
